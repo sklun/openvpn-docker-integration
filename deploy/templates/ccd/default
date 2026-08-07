@@ -1,0 +1,2 @@
+# 默认 CCD 不设置额外路由；需要时通过 ovpn addroute 添加。
+# push "route <ip> <mask>"

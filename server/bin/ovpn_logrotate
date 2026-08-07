@@ -1,0 +1,33 @@
+#!/bin/bash
+# 功能说明：创建并执行 OpenVPN 与 iptables 日志的轮转、压缩和保留策略。
+
+# 0 0 * * * /opt/openvpn-$env/maintenance/rotate-logs.sh
+# tail /proc/$(pidof openvpn)/fd/2
+log_lists=(
+    iptables.log
+    openvpn.log
+)
+# 拆分后文件的存放目录
+LOG_DIR="$OPENVPN"/logs
+# 日志保留天数
+# shellcheck source=/dev/null
+source "$OPENVPN/ovpn.env"
+LOG_RETAIN_TIME=${LOG_RETAIN_DAYS:-90}
+
+for log_name in "${log_lists[@]}"; do
+    # 创建 logrotate 配置
+    if [[ ! -f /etc/logrotate.d/openvpn-"$log_name" ]]; then
+        cat <<EOF >/etc/logrotate.d/openvpn-"$log_name"
+${LOG_DIR}/${log_name} {
+    daily
+    missingok
+    dateext
+    rotate $LOG_RETAIN_TIME
+    copytruncate
+    compress
+    notifempty
+}
+EOF
+    fi
+    logrotate -f /etc/logrotate.d/openvpn-"$log_name"
+done

@@ -1,0 +1,6 @@
+*.tar.gz
+.DS_Store
+test-results/
+.idea/
+.vscode/
+/AGENTS.md

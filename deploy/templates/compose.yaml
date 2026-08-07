@@ -1,0 +1,13 @@
+services:
+  openvpn:
+    image: ${OVPN_IMAGE}
+    container_name: ${OVPN_CONTAINER_NAME}
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "${OVPN_PORT}:1194/${OVPN_PORT_PROTO}"
+    volumes:
+      - ${OVPN_LOCAL_PATH}:${OPENVPN}
+    environment:
+      OPENVPN: ${OPENVPN}

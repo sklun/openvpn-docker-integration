@@ -1,0 +1,62 @@
+#!/bin/bash
+# 功能说明：初始化容器网络、访问策略和日志服务，然后以前台模式启动 OpenVPN。
+
+set -eo pipefail
+
+OPENVPN=${OPENVPN:-/etc/openvpn}
+# shellcheck source=/dev/null
+source "$OPENVPN/ovpn.env"
+
+is_true() {
+    [[ ${1:-false} == "true" ]]
+}
+
+iptables_add_once() {
+    local table=$1
+    shift
+    iptables -t "$table" -C "$@" 2>/dev/null || iptables -t "$table" -A "$@"
+}
+
+mkdir -p /dev/net "$OPENVPN"/{ccd,config,hooks,logs,state}
+[[ -c /dev/net/tun ]] || mknod /dev/net/tun c 10 200
+
+NAT_DEVICE=${OVPN_NATDEVICE:-eth0}
+if is_true "${OVPN_NAT:-false}" || is_true "${OVPN_DEFROUTE:-false}"; then
+    iptables_add_once nat POSTROUTING -s "$OVPN_CLIENT_SUBNET" -o "$NAT_DEVICE" -j MASQUERADE
+    if declare -p OVPN_ROUTES >/dev/null 2>&1; then
+        for route in "${OVPN_ROUTES[@]}"; do
+            [[ -n $route ]] && iptables_add_once nat POSTROUTING -s "$route" -o "$NAT_DEVICE" -j MASQUERADE
+        done
+    fi
+fi
+
+if [[ -f $EASYRSA_PKI/crl.pem && $EASYRSA_PKI/crl.pem -nt $OPENVPN/crl.pem ]]; then
+    cp -f "$EASYRSA_PKI/crl.pem" "$OPENVPN/crl.pem"
+    chmod 644 "$OPENVPN/crl.pem"
+fi
+
+[[ -f $OPENVPN/state/ipset.rules ]] && ipset restore -exist <"$OPENVPN/state/ipset.rules"
+[[ -f $OPENVPN/state/iptables.rules ]] && iptables-restore <"$OPENVPN/state/iptables.rules"
+
+if is_true "${IPTABLES_POLICY:-false}"; then
+    iptables -C FORWARD -i tun0 -d "$OVPN_VPC_SUBNET" -m comment --comment "reject all vpc subnet" -j DROP 2>/dev/null || \
+        iptables -A FORWARD -i tun0 -d "$OVPN_VPC_SUBNET" -m comment --comment "reject all vpc subnet" -j DROP
+    iptables -C FORWARD -i tun0 -d "$OVPN_VPC_SUBNET" -p tcp --tcp-flags FIN,SYN,RST,ACK SYN \
+        -m comment --comment "client request log" -j NFLOG --nflog-prefix client-request --nflog-group 16 2>/dev/null || \
+        iptables -I FORWARD -i tun0 -d "$OVPN_VPC_SUBNET" -p tcp --tcp-flags FIN,SYN,RST,ACK SYN \
+            -m comment --comment "client request log" -j NFLOG --nflog-prefix client-request --nflog-group 16
+fi
+
+if [[ -f $OPENVPN/config/ulogd.conf ]]; then
+    cp "$OPENVPN/config/ulogd.conf" /etc/ulogd.conf
+    ulogd -d
+fi
+
+ipset save >"$OPENVPN/state/ipset.rules"
+iptables-save >"$OPENVPN/state/iptables.rules"
+
+args=(--config "$OPENVPN/openvpn.conf")
+[[ -d $OPENVPN/ccd ]] && args+=(--client-config-dir "$OPENVPN/ccd")
+[[ -r $OPENVPN/crl.pem ]] && args+=(--crl-verify "$OPENVPN/crl.pem")
+
+exec openvpn "${args[@]}" "$@"

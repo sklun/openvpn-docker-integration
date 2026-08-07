@@ -1,0 +1,26 @@
+#!/bin/bash
+# 功能说明：为全部有效客户端证书批量生成分离式和内嵌式客户端配置。
+
+if [ -z "$OPENVPN" ]; then
+    export OPENVPN="$PWD"
+fi
+# shellcheck source=/dev/null
+if ! source "$OPENVPN/ovpn.env"; then
+    echo "Could not source $OPENVPN/ovpn.env."
+    exit 1
+fi
+if [ -z "$EASYRSA_PKI" ]; then
+    export EASYRSA_PKI="$OPENVPN/pki"
+fi
+
+pushd "$EASYRSA_PKI" >/dev/null || exit 1
+shopt -s nullglob
+for name in issued/*.crt; do
+    name=${name%.crt}
+    name=${name#issued/}
+    if [ "$name" != "$OVPN_HOST" ]; then
+        ovpn_getclient "$name" separated
+        ovpn_getclient "$name" combined-save
+    fi
+done
+popd >/dev/null || exit 1

@@ -1,0 +1,36 @@
+#!/bin/bash
+# 功能说明：为指定用户生成或重置 TOTP 密钥及二维码信息。
+
+#
+# Generate OpenVPN users via google authenticator
+#
+
+# shellcheck source=/dev/null
+if ! source "$OPENVPN/ovpn.env"; then
+    echo "Could not source $OPENVPN/ovpn.env."
+    exit 1
+fi
+
+if [ "${OTP:-false}" != "true" ]; then
+    echo "OTP authentication not enabled, please regenerate configuration using -2 flag"
+    exit 1
+fi
+
+if [ -z "${1:-}" ]; then
+    echo "Usage: ovpn_otp_user USERNAME"
+    exit 1
+fi
+
+# Ensure the otp folder is present
+[ -d "$OPENVPN/otp" ] || mkdir -p "$OPENVPN/otp"
+
+# Binary is present in image, save an $user.google_authenticator file in /etc/openvpn/otp
+if [ "${2:-}" == "interactive" ]; then
+    # Authenticator will ask for other parameters. User can choose rate limit, token reuse policy and time window policy
+    # Always use time base OTP otherwise storage for counters must be configured somewhere in volume
+    google-authenticator --time-based --force -l "${1}@${OVPN_HOST}" -s "$OPENVPN/otp/${1}.google_authenticator"
+else
+    # Skip confirmation if not running in interctive mode. Essential for integration tests.
+    google-authenticator --time-based --disallow-reuse --force --rate-limit=3 --rate-time=30 --window-size=3 \
+        -l "${1}@${OVPN_HOST}" -s "$OPENVPN/otp/${1}.google_authenticator" --no-confirm
+fi

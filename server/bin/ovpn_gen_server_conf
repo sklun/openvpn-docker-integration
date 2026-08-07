@@ -1,0 +1,167 @@
+#!/bin/bash
+# 功能说明：读取 ovpn.env，生成服务端配置以及对应的认证和连接钩子设置。
+
+set -eo pipefail
+
+OPENVPN=${OPENVPN:-/etc/openvpn}
+ENV_FILE=${1:-$OPENVPN/ovpn.env}
+[[ -r $ENV_FILE ]] || { echo "Cannot read env file: $ENV_FILE" >&2; exit 1; }
+
+# shellcheck source=/dev/null
+source "$ENV_FILE"
+
+is_true() {
+    [[ ${1:-false} == "true" ]]
+}
+
+cidr_to_mask() {
+    local prefix=${1#*/} full partial i value output=""
+    full=$((prefix / 8))
+    partial=$((prefix % 8))
+    for ((i = 0; i < 4; i++)); do
+        if ((i < full)); then
+            value=255
+        elif ((i == full && partial > 0)); then
+            value=$((256 - 2 ** (8 - partial)))
+        else
+            value=0
+        fi
+        output+="${output:+.}$value"
+    done
+    printf '%s\n' "$output"
+}
+
+append_array() {
+    local prefix=$1 value
+    shift
+    for value in "$@"; do
+        [[ -n $value ]] && printf '%s%s\n' "$prefix" "$value" >>"$OVPN_CONF"
+    done
+}
+
+append_routes() {
+    local route ip prefix
+    for route in "$@"; do
+        [[ -n $route ]] || continue
+        if [[ $route == */* ]]; then
+            ip=${route%/*}
+            prefix=${route#*/}
+            printf 'route %s %s\n' "$ip" "$(cidr_to_mask "$prefix")" >>"$OVPN_CONF"
+        else
+            printf 'route %s\n' "$route" >>"$OVPN_CONF"
+        fi
+    done
+}
+
+OVPN_CONF="$OPENVPN/openvpn.conf"
+mkdir -p "$OPENVPN"/{auth,ccd,clients,config,hooks,logs,otp,state,templates/ccd}
+
+cat >"$OVPN_CONF" <<EOF
+proto ${OVPN_PROTO:-udp}
+port 1194
+dev ${OVPN_DEVICE:-tun}
+server ${OVPN_CLIENT_SUBNET%/*} $(cidr_to_mask "$OVPN_CLIENT_SUBNET")
+
+key $EASYRSA_PKI/private/$OVPN_HOST.key
+ca $EASYRSA_PKI/ca.crt
+cert $EASYRSA_PKI/issued/$OVPN_HOST.crt
+dh $EASYRSA_PKI/dh.pem
+tls-auth $EASYRSA_PKI/ta.key
+key-direction 0
+
+verb ${LOG_VERB:-3}
+log-append $OVPN_LOG_PATH
+status $OVPN_STATUS_LOG_PATH
+status-version 2
+
+keepalive ${OVPN_KEEPALIVE:-10 60}
+persist-key
+persist-tun
+topology subnet
+script-security 2
+client-connect $OVPN_HOOKS_PATH/client-connect.sh
+client-disconnect $OVPN_HOOKS_PATH/client-disconnect.sh
+EOF
+
+if is_true "${LDAP:-false}" && is_true "${IPTABLES_POLICY:-false}"; then
+    cat >>"$OVPN_CONF" <<EOF
+# LDAP first-connect provisioning updates ipset/iptables and requires root.
+EOF
+else
+    cat >>"$OVPN_CONF" <<EOF
+user nobody
+group nogroup
+EOF
+fi
+
+[[ -n ${OVPN_CIPHER:-} ]] && echo "data-ciphers-fallback $OVPN_CIPHER" >>"$OVPN_CONF"
+[[ -n ${OVPN_TLS_CIPHER:-} ]] && echo "tls-cipher $OVPN_TLS_CIPHER" >>"$OVPN_CONF"
+[[ -n ${OVPN_AUTH:-} ]] && echo "auth $OVPN_AUTH" >>"$OVPN_CONF"
+
+if [[ -n ${OVPN_MTU:-} ]]; then
+    echo "tun-mtu $OVPN_MTU" >>"$OVPN_CONF"
+    echo "push \"tun-mtu $OVPN_MTU\"" >>"$OVPN_CONF"
+fi
+
+if [[ -n ${OVPN_MANAGEMENT:-} ]]; then
+    echo "management $OVPN_MANAGEMENT $OVPN_MANAGEMENT_PASS" >>"$OVPN_CONF"
+fi
+
+if declare -p OVPN_DNS_SERVERS >/dev/null 2>&1; then
+    for dns in "${OVPN_DNS_SERVERS[@]}"; do
+        [[ -n $dns ]] && echo "push \"dhcp-option DNS $dns\"" >>"$OVPN_CONF"
+    done
+fi
+if declare -p OVPN_ROUTES >/dev/null 2>&1; then
+    append_routes "${OVPN_ROUTES[@]}"
+fi
+# shellcheck disable=SC2153  # Loaded from ovpn.env.
+if declare -p OVPN_PUSH >/dev/null 2>&1; then
+    for push in "${OVPN_PUSH[@]}"; do
+        [[ -n $push ]] && echo "push \"$push\"" >>"$OVPN_CONF"
+    done
+fi
+
+if is_true "${LDAP:-false}"; then
+    # shellcheck disable=SC2153  # Loaded from ovpn.env.
+    ldap_url=${LDAP_URL#ldap://}
+    ldap_url=${ldap_url#ldaps://}
+    cat >>"$OVPN_CONF" <<EOF
+
+plugin /usr/lib/openvpn/plugins/openvpn-auth-ldap.so $LDAP_CONF
+username-as-common-name
+reneg-sec 0
+auth-user-pass-verify $OVPN_HOOKS_PATH/ldap-authorize.sh via-file
+EOF
+    is_true "${LDAP_DISABLE_CERT_VERIFY:-false}" && echo "verify-client-cert optional" >>"$OVPN_CONF"
+
+    mkdir -p "$(dirname "$LDAP_CONF")"
+    cat >"$LDAP_CONF" <<EOF
+<LDAP>
+    URL ldap://$ldap_url
+    BindDN $LDAP_BIND_DN
+    Password $LDAP_PASSWORD
+    Timeout 15
+    TLSEnable no
+    FollowReferrals yes
+</LDAP>
+<Authorization>
+    BaseDN $LDAP_BASE_DN
+    SearchFilter $LDAP_SEARCHFILTER
+    RequireGroup false
+</Authorization>
+EOF
+    chmod 600 "$LDAP_CONF"
+elif is_true "${OTP:-false}" || is_true "${PASSWORD_AUTH:-false}"; then
+    cat >>"$OVPN_CONF" <<EOF
+
+plugin /usr/lib/openvpn/plugins/openvpn-plugin-auth-pam.so openvpn
+reneg-sec 0
+EOF
+fi
+
+if declare -p EXTRA_CONF >/dev/null 2>&1; then
+    append_array "" "${EXTRA_CONF[@]}"
+fi
+
+echo "Generated: $OVPN_CONF"

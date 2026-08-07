@@ -1,0 +1,37 @@
+#!/bin/bash
+# 功能说明：汇总客户端证书的签发时间、到期时间和吊销状态。
+
+set -euo pipefail
+
+OPENVPN=${OPENVPN:-/etc/openvpn}
+# shellcheck source=/dev/null
+source "$OPENVPN/ovpn.env"
+
+cd "$EASYRSA_PKI"
+if [[ -f crl.pem ]]; then
+    cat ca.crt crl.pem >cacheck.pem
+else
+    cp ca.crt cacheck.pem
+fi
+trap 'rm -f cacheck.pem' EXIT
+
+printf 'name | begin | end | status\n'
+shopt -s nullglob
+for path in issued/*.crt; do
+    name=${path#issued/}
+    name=${name%.crt}
+    [[ $name == "$OVPN_HOST" ]] && continue
+
+    begin=$(openssl x509 -noout -startdate -in "$path" | cut -d= -f2-)
+    end=$(openssl x509 -noout -enddate -in "$path" | cut -d= -f2-)
+    if result=$(openssl verify -crl_check -CAfile cacheck.pem "$path" 2>&1); then
+        status=VALID
+    elif grep -q 'error 10' <<<"$result"; then
+        status=EXPIRED
+    elif grep -q 'error 23' <<<"$result"; then
+        status=REVOKED
+    else
+        status=INVALID
+    fi
+    printf '%s | %s | %s | %s\n' "$name" "$begin" "$end" "$status"
+done

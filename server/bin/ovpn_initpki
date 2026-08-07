@@ -1,0 +1,18 @@
+#!/bin/bash
+# 功能说明：初始化 Easy-RSA PKI，并生成 CA、服务端证书、DH、TLS 密钥和吊销列表。
+
+set -euo pipefail
+
+OPENVPN=${OPENVPN:-/etc/openvpn}
+# shellcheck source=/dev/null
+source "$OPENVPN/ovpn.env"
+
+ca_args=()
+[[ ${1:-} == nopass ]] && ca_args=(nopass)
+
+easyrsa --batch init-pki
+easyrsa --batch build-ca "${ca_args[@]}"
+easyrsa --batch gen-dh
+openvpn --genkey secret "$EASYRSA_PKI/ta.key"
+easyrsa --batch build-server-full "$OVPN_HOST" nopass
+easyrsa --batch gen-crl

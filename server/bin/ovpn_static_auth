@@ -1,0 +1,32 @@
+#!/bin/bash
+# 功能说明：供 PAM 调用，校验指定用户是否具有匹配的预置固定密码。
+
+#
+# Validate static passwords for selected OpenVPN users.
+#
+
+set -euo pipefail
+
+OPENVPN=${OPENVPN:-/etc/openvpn}
+PASSWORD_FILE="${OVPN_STATIC_PASSWORD_FILE:-$OPENVPN/auth/static-passwords}"
+
+if [ -z "${PAM_USER:-}" ]; then
+    exit 1
+fi
+
+if [ ! -r "${PASSWORD_FILE}" ]; then
+    exit 1
+fi
+
+input_password="$(cat)"
+stored_password="$(awk -F ':' -v user="${PAM_USER}" '$1 == user {print substr($0, index($0, ":") + 1); exit}' "${PASSWORD_FILE}")"
+
+if [ -z "${stored_password}" ]; then
+    exit 1
+fi
+
+if [ "${input_password}" = "${stored_password}" ]; then
+    exit 0
+fi
+
+exit 1
