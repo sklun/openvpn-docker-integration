@@ -161,14 +161,16 @@ bash install.sh production ./ovpn.env
 
 用户名必须以字母开头，只能包含字母、数字、点、下划线和连字符。非 LDAP 模式会在内部追加环境后缀，最终名称长度不能超过 31 个字符。
 
+启用 OTP 时，`createuser` 和 `resetotp` 会在终端输出可供身份验证器扫描的 UTF-8 二维码。`createuser` 还会将包含二维码和 OTP 信息的输出保存到用户客户端目录；二维码包含 OTP 密钥，应按敏感凭据保护。
+
 ### 固定密码
 
 | 命令 | 用途 |
 | --- | --- |
-| `ovpn addpassuser ENV USER [PASSWORD]` | 添加固定密码用户 |
-| `ovpn delpassuser ENV USER` | 删除固定密码用户 |
-| `ovpn chpassuser ENV USER [PASSWORD]` | 修改固定密码 |
-| `ovpn listpassuser ENV` | 列出固定密码用户 |
+| `ovpn addpass ENV USER [PASSWORD]` | 添加固定密码用户 |
+| `ovpn delpass ENV USER` | 删除固定密码用户 |
+| `ovpn chpass ENV USER [PASSWORD]` | 修改固定密码 |
+| `ovpn listpass ENV` | 列出固定密码用户 |
 
 省略密码参数时，命令会通过隐藏输入读取密码，避免密码出现在 shell 历史和进程参数中。
 
@@ -179,20 +181,29 @@ bash install.sh production ./ovpn.env
 | `ovpn listroute ENV USER` | 查看用户路由 |
 | `ovpn addroute ENV USER ROUTE` | 添加用户 IPv4 路由 |
 | `ovpn delroute ENV USER ROUTE` | 删除用户路由 |
-| `ovpn adddomainroute ENV USER FILE [--yes]` | 解析域名文件并添加用户路由 |
+| `ovpn adddomainroute ENV USER SOURCE [--yes]` | 解析域名文件或参数并添加用户路由 |
+| `ovpn adddomainrouteall ENV SOURCE [--yes]` | 为所有 CCD 用户添加域名路由 |
 | `ovpn addrouteall ENV ROUTE` | 为所有用户添加路由 |
 | `ovpn delrouteall ENV ROUTE` | 为所有用户删除路由 |
 | `ovpn listhwaddr ENV USER` | 查看用户硬件地址绑定 |
 | `ovpn delhwaddr ENV USER` | 删除用户硬件地址绑定 |
 
-`ROUTE` 接受 IPv4 地址或 CIDR。域名文件每行一个域名，空行和以 `#` 开头的注释会被忽略：
+`ROUTE` 接受 IPv4 地址或 CIDR。`SOURCE` 可以是域名文件，也可以是直接传入的单个域名或以英文逗号分隔的多个域名。域名文件每行一个域名，空行和以 `#` 开头的注释会被忽略：
 
 ```text
 example.com
 api.example.com
 ```
 
-`adddomainroute` 默认显示解析结果并要求确认，自动化场景可传入 `--yes`。
+`adddomainroute` 默认显示解析结果并要求确认，自动化场景可传入 `--yes`。已存在于用户 CCD 的域名路由会计入重复数，并以 `域名 -> IPv4/32` 格式列出；如果解析结果全部已存在，命令直接成功返回且不再要求确认。
+
+`adddomainrouteall` 使用相同的 `SOURCE` 格式，将域名解析结果应用到全部 CCD 用户。域名只解析一次，命令只确认一次；待添加和重复明细会同时显示对应用户名。
+
+```shell
+ovpn adddomainroute production alice example.com,api.example.com
+ovpn adddomainroute production alice example.com,api.example.com --yes
+ovpn adddomainrouteall production example.com,api.example.com --yes
+```
 
 ### 服务
 
@@ -216,7 +227,9 @@ ovpn createuser production alice
 ovpn clientip production alice 192.168.255.10
 ovpn addroute production alice 10.20.0.0/16
 ovpn adddomainroute production alice ./domains.txt
-ovpn addpassuser production alice
+ovpn adddomainroute production alice example.com,api.example.com
+ovpn adddomainrouteall production ./domains.txt --yes
+ovpn addpass production alice
 ovpn status production
 ```
 

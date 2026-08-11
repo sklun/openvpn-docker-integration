@@ -21,6 +21,8 @@ grep -Fq '固定密码认证:' <<<"$help_output"
 grep -Fq '路由与设备:' <<<"$help_output"
 grep -Fq 'adddomainroute' <<<"$help_output"
 grep -Fq '| -adr' <<<"$help_output"
+grep -Fq 'adddomainrouteall' <<<"$help_output"
+grep -Fq '| -adra' <<<"$help_output"
 grep -Fq '服务与规则:' <<<"$help_output"
 grep -Fq 'backuphostnetwork' <<<"$help_output"
 grep -Fq '非 LDAP 模式会自动追加 -<env>' <<<"$help_output"
@@ -93,6 +95,47 @@ for legacy_directory in scripts tools deploy/scripts deploy/tools server/scripts
 done
 template_last_byte=$(tail -c 1 "$PROJECT_ROOT/deploy/templates/ccd/default" | od -An -t x1 | tr -d '[:space:]')
 [[ $template_last_byte == 0a ]]
+
+echo "+ OTP QR output"
+otp_runtime="$TEST_ROOT/otp-runtime"
+otp_bin="$TEST_ROOT/otp-bin"
+otp_args_log="$TEST_ROOT/otp-args.log"
+otp_uri_log="$TEST_ROOT/otp-uri.log"
+mkdir -p "$otp_runtime" "$otp_bin"
+cat >"$otp_runtime/ovpn.env" <<'EOF'
+OTP=true
+OVPN_HOST="vpn.test.example"
+EOF
+cat >"$otp_bin/google-authenticator" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >"$OTP_ARGS_LOG"
+secret_file=""
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        -s)
+            secret_file=$2
+            shift 2
+            ;;
+        *) shift ;;
+    esac
+done
+printf 'JBSWY3DPEHPK3PXP\n' >"$secret_file"
+printf 'AUTHENTICATOR-OUTPUT\n'
+EOF
+cat >"$otp_bin/qrencode" <<'EOF'
+#!/bin/sh
+cat >"$OTP_URI_LOG"
+printf 'QR-CODE-OUTPUT\n'
+EOF
+chmod +x "$otp_bin/google-authenticator" "$otp_bin/qrencode"
+otp_output=$(OPENVPN="$otp_runtime" OTP_ARGS_LOG="$otp_args_log" OTP_URI_LOG="$otp_uri_log" \
+    PATH="$otp_bin:$PATH" bash "$PROJECT_ROOT/server/bin/ovpn_otp_user" alice)
+grep -Fq 'AUTHENTICATOR-OUTPUT' <<<"$otp_output"
+grep -Fq 'QR-CODE-OUTPUT' <<<"$otp_output"
+grep -Fq -- '--qr-mode=NONE' "$otp_args_log"
+grep -Fq -- '-l alice@vpn.test.example' "$otp_args_log"
+grep -Fq -- '-i vpn.test.example' "$otp_args_log"
+grep -Fxq 'otpauth://totp/alice@vpn.test.example?secret=JBSWY3DPEHPK3PXP&issuer=vpn.test.example' "$otp_uri_log"
 
 make_env() {
     local target=$1 ldap=$2 otp=$3 password_auth=$4
@@ -179,6 +222,9 @@ case ${2:-} in
         ;;
     direct-api.test)
         printf '10.30.0.14 STREAM direct-api.test\n'
+        ;;
+    all.test)
+        printf '10.30.0.15 STREAM all.test\n'
         ;;
     cancel.test)
         printf '10.30.0.12 STREAM cancel.test\n'
@@ -329,6 +375,26 @@ if grep -Eq '待添加路由:|是否继续添加以上路由' "$domain_log"; the
 fi
 [[ $(grep -Fxc 'push "route 10.30.0.13 255.255.255.255"' "$password_runtime/ccd/alice-test") -eq 1 ]]
 [[ $(grep -Fxc 'push "route 10.30.0.14 255.255.255.255"' "$password_runtime/ccd/alice-test") -eq 1 ]]
+
+cp "$PROJECT_ROOT/deploy/templates/ccd/default" "$password_runtime/ccd/bob-test"
+printf 'push "route 10.30.0.15 255.255.255.255"\n' >>"$password_runtime/ccd/alice-test"
+OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
+    adddomainrouteall test all.test --yes >/dev/null 2>"$domain_log"
+grep -Fq '|   bob-test: all.test -> 10.30.0.15/32' "$domain_log"
+grep -Fq '|   alice-test: all.test -> 10.30.0.15/32' "$domain_log"
+grep -Fq '| 汇总: 解析域名 1 个，待添加用户路由 1 个，重复 1 个，失败 0 个' "$domain_log"
+grep -Fq '* 全部用户域名路由添加完成: test，成功 1 个，重复 1 个' "$domain_log"
+grep -Fxq 'push "route 10.30.0.15 255.255.255.255"' "$password_runtime/ccd/alice-test"
+grep -Fxq 'push "route 10.30.0.15 255.255.255.255"' "$password_runtime/ccd/bob-test"
+
+OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
+    adddomainrouteall test all.test </dev/null >/dev/null 2>"$domain_log"
+grep -Fq '| 汇总: 解析域名 1 个，待添加用户路由 0 个，重复 2 个，失败 0 个' "$domain_log"
+grep -Fq '* 全部用户域名路由添加完成: test，成功 0 个，重复 2 个' "$domain_log"
+if grep -Eq '待添加路由:|是否继续添加以上路由' "$domain_log"; then
+    echo "existing all-user domain routes unexpectedly requested confirmation" >&2
+    exit 1
+fi
 
 printf 'cancel.test\n' >"$domain_file"
 printf 'n\n' | OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \

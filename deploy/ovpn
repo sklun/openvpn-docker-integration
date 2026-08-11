@@ -9,6 +9,7 @@ USER_INPUT=${3:-}
 ARGUMENT=${4:-}
 OPTION=${5:-}
 
+# 输出管理命令的用法、参数约定、注意事项和示例。
 usage() {
 	cat <<'EOF'
 说明:
@@ -27,16 +28,17 @@ usage() {
 	resetotp   | -ro  <env> <user>        生成或重置用户 OTP 密钥
 
 固定密码认证:
-	addpassuser  | -apu <env> <user> [password]  添加固定密码用户
-	delpassuser  | -dpu <env> <user>             删除固定密码用户
-	chpassuser   | -cpu <env> <user> [password]  修改固定密码
-	listpassuser | -lpu <env>                    列出固定密码用户名
+	addpass  | -ap <env> <user> [password]  添加固定密码用户
+	delpass  | -dp <env> <user>             删除固定密码用户
+	chpass   | -cp <env> <user> [password]  修改固定密码
+	listpass | -lp <env>                    列出固定密码用户名
 
 路由与设备:
 	listroute   	| -lr  <env> <user>          		查看用户 CCD 和运行中的 ipset 路由
 	addroute    	| -ar  <env> <user> <route>  		为用户添加单 IP 或 CIDR 路由
 	delroute    	| -dr  <env> <user> <route>  		删除用户的单 IP 或 CIDR 路由
-	adddomainroute	| -adr <env> <user> <file> [--yes]	解析域名文件并批量添加 IPv4 路由
+	adddomainroute	| -adr <env> <user> <source> [--yes]	解析域名文件或参数并批量添加 IPv4 路由
+	adddomainrouteall | -adra <env> <source> [--yes]		为全部 CCD 用户添加域名 IPv4 路由
 	addrouteall 	| -ara <env> <route>         		为全部 CCD 用户添加路由
 	delrouteall 	| -dra <env> <route>         		删除全部 CCD 用户的指定路由
 	listhwaddr  	| -lh  <env> <user>          		查看用户当前绑定的设备信息
@@ -58,7 +60,8 @@ usage() {
 	user     必须以字母开头，可包含字母、数字、点、下划线和连字符。
 			非 LDAP 模式会自动追加 -<env>；归一化后最长 31 个字符。
 	route    支持单个 IPv4（如 10.0.6.1）或 IPv4 CIDR（如 10.0.6.0/24）。
-	file     域名列表文件，每行一个域名，支持空行和 # 注释。
+	source   可读域名列表文件，或单个域名/以英文逗号分隔的多个域名。
+			文件支持每行一个域名、空行和 # 注释。
 	password 建议省略并使用隐藏输入，避免明文密码进入 Shell 历史。
 
 注意:
@@ -72,29 +75,36 @@ usage() {
 	ovpn clientip production alice
 	ovpn addroute production alice 10.20.0.0/16
 	ovpn adddomainroute production alice ./domains.txt
+	ovpn adddomainroute production alice example.com,api.example.com
 	ovpn adddomainroute production alice ./domains.txt --yes
-	ovpn addpassuser production alice
+	ovpn adddomainrouteall production example.com,api.example.com --yes
+	ovpn addpass production alice
 	ovpn status production
 EOF
 }
 
+# 向标准错误输出任务开始日志。
 log_start() {
 	printf '+ %s\n' "$*" >&2
 }
 
+# 向标准错误输出任务过程日志。
 log_info() {
 	printf '| %s\n' "$*" >&2
 }
 
+# 向标准错误输出任务成功日志。
 log_success() {
 	printf '* %s\n' "$*" >&2
 }
 
+# 输出错误信息并以失败状态终止脚本。
 fail() {
 	printf -- '- %s\n' "$*" >&2
 	exit 1
 }
 
+# 捕获未处理错误，输出命令上下文并保留原退出码。
 handle_error() {
 	local exit_code=$1 line_number=$2
 	printf -- '- 操作失败（命令: %s，环境: %s，行: %s，退出码: %s）\n' \
@@ -104,10 +114,12 @@ handle_error() {
 
 trap 'handle_error "$?" "$LINENO"' ERR
 
+# 判断指定值是否为布尔字符串 true。
 is_true() {
 	[[ ${1:-false} == "true" ]]
 }
 
+# 校验环境名并加载运行时配置、路径和容器参数。
 load_env() {
 	[[ -n $ENV_NAME ]] || fail "缺少环境名，请运行 ovpn help 查看用法"
 	[[ $ENV_NAME =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || fail "环境名格式不正确: $ENV_NAME"
@@ -140,19 +152,23 @@ load_env() {
 	log_info "已加载环境: ${ENV_NAME}（运行目录: ${LOCAL_PATH}）"
 }
 
+# 使用当前环境的 Compose 文件执行 Docker Compose 子命令。
 compose_cmd() {
 	export OPENVPN OVPN_IMAGE OVPN_PORT OVPN_PROTO OVPN_PORT_PROTO OVPN_CONTAINER_NAME OVPN_LOCAL_PATH
 	docker compose -f "$COMPOSE_FILE" "$@"
 }
 
+# 判断当前环境的 OpenVPN 容器是否正在运行。
 container_running() {
 	[[ $(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true) == true ]]
 }
 
+# 确保 OpenVPN 容器正在运行，否则终止当前操作。
 require_running() {
 	container_running || fail "容器未运行: $CONTAINER_NAME"
 }
 
+# 校验字符串是否为合法 IPv4 地址。
 valid_ipv4() {
 	local ip=$1 octet
 	[[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -162,6 +178,7 @@ valid_ipv4() {
 	done
 }
 
+# 校验字符串是否为合法 IPv4 地址或 CIDR 网段。
 valid_cidr() {
 	local value=$1 ip prefix
 	if [[ $value == */* ]]; then
@@ -173,6 +190,7 @@ valid_cidr() {
 	fi
 }
 
+# 校验字符串是否为受支持的域名格式。
 valid_domain() {
 	local domain=${1%.} label
 	local -a labels
@@ -184,6 +202,7 @@ valid_domain() {
 	done
 }
 
+# 从标准输入筛选并输出合法的 IPv4 地址。
 filter_valid_ipv4() {
 	local candidate
 	while IFS= read -r candidate; do
@@ -192,6 +211,7 @@ filter_valid_ipv4() {
 	done
 }
 
+# 依次使用可用的系统解析工具获取域名对应的 IPv4 地址。
 resolve_domain_ipv4() {
 	local domain=$1 results="" valid_results=""
 	if command -v getent >/dev/null 2>&1; then
@@ -209,6 +229,7 @@ resolve_domain_ipv4() {
 	printf '%s\n' "$valid_results"
 }
 
+# 将点分十进制 IPv4 地址转换为无符号整数。
 ipv4_to_int() {
 	local a b c d
 	IFS=. read -r a b c d <<<"$1"
@@ -217,6 +238,7 @@ ipv4_to_int() {
 
 }
 
+# 将 IPv4 无符号整数转换为点分十进制地址。
 int_to_ipv4() {
 	local value=$1
 	printf '%d.%d.%d.%d\n' \
@@ -224,8 +246,10 @@ int_to_ipv4() {
 		"$(((value >> 8) & 255))" "$((value & 255))"
 }
 
+# 将 CIDR 前缀长度转换为点分十进制子网掩码。
 cidr_to_mask() {
 	local prefix=$1 full partial i value output=""
+	[[ $prefix =~ ^([0-9]|[12][0-9]|3[0-2])$ ]] || return 1
 	full=$((prefix / 8))
 	partial=$((prefix % 8))
 	for ((i = 0; i < 4; i++)); do
@@ -241,26 +265,35 @@ cidr_to_mask() {
 	printf '%s\n' "$output"
 }
 
+# 将点分十进制子网掩码转换为 CIDR 前缀长度。
 mask_to_cidr() {
-	local mask=$1 octet bits=0
-	IFS=. read -ra octets <<<"$mask"
+	local mask=$1 octet octet_bits bits=0 finished=0
+	local -a octets
+	[[ $mask =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+	IFS=. read -r -a octets <<<"$mask"
+	((${#octets[@]} == 4)) || return 1
+
 	for octet in "${octets[@]}"; do
 		case $octet in
-		255) bits=$((bits + 8)) ;;
-		254) bits=$((bits + 7)) ;;
-		252) bits=$((bits + 6)) ;;
-		248) bits=$((bits + 5)) ;;
-		240) bits=$((bits + 4)) ;;
-		224) bits=$((bits + 3)) ;;
-		192) bits=$((bits + 2)) ;;
-		128) bits=$((bits + 1)) ;;
-		0) ;;
+		255) octet_bits=8 ;;
+		254) octet_bits=7 ;;
+		252) octet_bits=6 ;;
+		248) octet_bits=5 ;;
+		240) octet_bits=4 ;;
+		224) octet_bits=3 ;;
+		192) octet_bits=2 ;;
+		128) octet_bits=1 ;;
+		0) octet_bits=0 ;;
 		*) return 1 ;;
 		esac
+		((finished == 0 || octet_bits == 0)) || return 1
+		bits=$((bits + octet_bits))
+		((octet_bits == 8)) || finished=1
 	done
 	printf '%d\n' "$bits"
 }
 
+# 校验并按环境规则归一化用户名及其关联路径。
 normalize_user() {
 	local raw=$1
 	[[ -n $raw ]] || fail "缺少用户名"
@@ -277,6 +310,7 @@ normalize_user() {
 	CLIENT_CERT="$LOCAL_PATH/pki/issued/$CLIENT_NAME.crt"
 }
 
+# 创建状态文件并设置固定密码数据所需的权限和属主。
 secure_file() {
 	local file=$1
 	touch "$file"
@@ -284,6 +318,7 @@ secure_file() {
 	chown 65534:65534 "$file" 2>/dev/null || true
 }
 
+# 设置运行目录属主，并单独收紧 OTP 密钥文件权限。
 set_runtime_ownership() {
 	local otp_file
 	chown -R 65534:65534 "$LOCAL_PATH"
@@ -294,6 +329,7 @@ set_runtime_ownership() {
 	done
 }
 
+# 按指定分隔格式原子删除文件中属于目标用户的记录。
 atomic_without_user() {
 	local file=$1 user=$2 delimiter=${3:-plain} temp
 	temp=$(mktemp "${file}.XXXXXX")
@@ -308,18 +344,20 @@ atomic_without_user() {
 	secure_file "$file"
 }
 
+# 将容器内当前 iptables 和 ipset 规则保存到运行目录。
 save_rules() {
 	require_running
 	docker exec "$CONTAINER_NAME" sh -c 'iptables-save > "$1/state/iptables.rules"' sh "$OPENVPN"
 	docker exec "$CONTAINER_NAME" sh -c 'ipset save > "$1/state/ipset.rules"' sh "$OPENVPN"
 }
 
+# 为用户分配未占用的固定 IP，并同步状态记录和 CCD。
 assign_client_ip() {
 	local first last candidate candidate_ip prefix mask lock_file
 	first=$(ipv4_to_int "$SUBNET_IP_FIRST")
 	last=$(ipv4_to_int "$SUBNET_IP_LAST")
 	prefix=${OVPN_CLIENT_SUBNET#*/}
-	mask=$(cidr_to_mask "$prefix")
+	mask=$(cidr_to_mask "$prefix") || fail "客户端网段的 CIDR 前缀无效: $OVPN_CLIENT_SUBNET"
 	lock_file="$LOCAL_PATH/state/.client-ip.lock"
 	exec 200>"$lock_file"
 	flock -w 10 200 || fail "无法锁定客户端 IP 状态文件"
@@ -344,6 +382,7 @@ assign_client_ip() {
 	fail "客户端网段没有可用地址: $OVPN_CLIENT_SUBNET"
 }
 
+# 为用户创建 ipset、iptables 访问规则并导入 CCD 路由。
 create_access_rules() {
 	local route ip mask prefix insert_line
 	require_running
@@ -364,13 +403,14 @@ create_access_rules() {
 
 	while read -r ip mask; do
 		[[ -n ${ip:-} && -n ${mask:-} ]] || continue
-		prefix=$(mask_to_cidr "$mask")
+		prefix=$(mask_to_cidr "$mask") || fail "用户 CCD 中的子网掩码无效: $mask"
 		route="$ip/$prefix"
 		docker exec "$CONTAINER_NAME" ipset add "$IPSET_NAME" "$route" -exist
 	done < <(awk '/^push "route / { gsub(/"/, ""); print $3, $4 }' "$CLIENT_CCD")
 	save_rules
 }
 
+# 创建证书用户、客户端配置、固定 IP、访问规则和可选 OTP。
 create_user() {
 	normalize_user "$USER_INPUT"
 	[[ ! -f $CLIENT_CERT ]] || fail "用户已存在: $CLIENT_NAME"
@@ -399,6 +439,7 @@ create_user() {
 	ls -1 "$CLIENT_OUTPUT"/*.ovpn
 }
 
+# 更新用户证书有效期并重新生成客户端配置。
 renew_user() {
 	normalize_user "$USER_INPUT"
 	[[ -f $CLIENT_CERT ]] || fail "用户不存在: $CLIENT_NAME"
@@ -412,6 +453,7 @@ renew_user() {
 	log_success "用户证书更新完成: $CLIENT_NAME"
 }
 
+# 从固定密码用户名单和密码文件中删除指定用户。
 remove_password_user() {
 	local user=$1
 	secure_file "$PASSWORD_USERS_FILE"
@@ -420,6 +462,7 @@ remove_password_user() {
 	atomic_without_user "$PASSWORD_FILE" "$user" colon
 }
 
+# 吊销证书并删除用户的配置、认证数据和访问规则。
 delete_user() {
 	normalize_user "$USER_INPUT"
 	[[ -f $CLIENT_CERT ]] || fail "用户不存在: $CLIENT_NAME"
@@ -447,12 +490,14 @@ delete_user() {
 	log_success "用户删除完成: $CLIENT_NAME"
 }
 
+# 列出当前环境的证书用户及证书状态。
 list_users() {
 	log_info "列出环境 $ENV_NAME 的 VPN 用户和证书状态"
 	docker run --rm -v "$LOCAL_PATH:$OPENVPN" -e "OPENVPN=$OPENVPN" \
 		"$OVPN_IMAGE" ovpn_listclients
 }
 
+# 按用户名或 IP 查询当前及历史客户端地址映射。
 query_client_ip() {
 	local input=$USER_INPUT
 	[[ -n $input ]] || fail "缺少用户名或客户端 IP"
@@ -471,6 +516,7 @@ query_client_ip() {
 	fi
 }
 
+# 为已启用 OTP 的证书用户生成或重置 OTP 密钥。
 reset_otp() {
 	normalize_user "$USER_INPUT"
 	is_true "${OTP:-false}" || fail "当前环境未启用 OTP"
@@ -481,6 +527,7 @@ reset_otp() {
 	log_success "OTP 重置完成: $CLIENT_NAME"
 }
 
+# 读取并校验命令参数或交互输入的固定密码。
 read_password() {
 	local value=${ARGUMENT:-}
 	if [[ -z $value ]]; then
@@ -493,6 +540,7 @@ read_password() {
 	PASSWORD_VALUE=$value
 }
 
+# 为现有证书用户添加固定密码认证凭据。
 add_password_user() {
 	normalize_user "$USER_INPUT"
 	is_true "${PASSWORD_AUTH:-false}" || fail "当前环境未启用固定密码认证"
@@ -512,6 +560,7 @@ add_password_user() {
 	log_success "固定密码用户添加完成: $CLIENT_NAME"
 }
 
+# 删除用户的固定密码认证凭据。
 delete_password_user() {
 	normalize_user "$USER_INPUT"
 	grep -Fxq "$CLIENT_NAME" "$PASSWORD_USERS_FILE" || fail "固定密码用户不存在: $CLIENT_NAME"
@@ -523,6 +572,7 @@ delete_password_user() {
 	log_success "固定密码用户删除完成: $CLIENT_NAME"
 }
 
+# 原子更新固定密码用户的密码。
 change_password_user() {
 	normalize_user "$USER_INPUT"
 	grep -Fxq "$CLIENT_NAME" "$PASSWORD_USERS_FILE" || fail "固定密码用户不存在: $CLIENT_NAME"
@@ -540,12 +590,14 @@ change_password_user() {
 	log_success "固定密码修改完成: $CLIENT_NAME"
 }
 
+# 列出固定密码用户名且不暴露密码内容。
 list_password_users() {
 	log_info "列出环境 $ENV_NAME 的固定密码用户（不显示密码）"
 	secure_file "$PASSWORD_USERS_FILE"
 	sort -u "$PASSWORD_USERS_FILE"
 }
 
+# 校验并规范化路由，生成 CIDR、掩码和 CCD 配置行。
 normalize_route() {
 	local route=$1
 	[[ -n $route ]] || fail "缺少路由参数"
@@ -557,6 +609,7 @@ normalize_route() {
 	ROUTE_LINE="push \"route $ROUTE_IP $ROUTE_MASK\""
 }
 
+# 为指定用户添加 CCD 路由和运行时 ipset 规则。
 add_route_for_user() {
 	local user=$1
 	normalize_user "$user"
@@ -573,6 +626,7 @@ add_route_for_user() {
 	log_success "路由添加完成: $CLIENT_NAME -> $ROUTE_CIDR"
 }
 
+# 删除指定用户的 CCD 路由和运行时 ipset 规则。
 delete_route_for_user() {
 	local user=$1 temp
 	normalize_user "$user"
@@ -592,23 +646,65 @@ delete_route_for_user() {
 	log_success "路由删除完成: $CLIENT_NAME -> $ROUTE_CIDR"
 }
 
+# 解析域名文件或逗号分隔参数，经确认后为单个或全部用户批量添加 IPv4 路由。
 add_domain_routes() {
-	local domain_file=$ARGUMENT raw_line domain resolved_ips ip existing answer index
+	local scope=${1:-user} domain_source confirm_option domain_input source_description
+	local scope_description summary_label completion_prefix partial_prefix
+	local raw_line domain resolved_output ip route_line existing answer index target target_ccd
 	local resolved_count=0 pending_count=0 duplicate_count=0 failed_count=0 success_count=0
-	local -a pending_domains=() pending_ips=()
+	local -a target_users=() resolved_domains=() resolved_route_ips=()
+	local -a pending_users=() pending_domains=() pending_ips=()
+	local -a duplicate_users=() duplicate_domains=() duplicate_ips=()
 
-	[[ -n $domain_file ]] || fail "缺少域名列表文件"
-	[[ -f $domain_file && -r $domain_file ]] || fail "找不到可读的域名列表文件: $domain_file"
-	[[ -z $OPTION || $OPTION == --yes ]] || fail "不支持的选项: $OPTION"
-	if ! command -v getent >/dev/null 2>&1 && ! command -v dig >/dev/null 2>&1 && \
-		! command -v nslookup >/dev/null 2>&1; then
+	case $scope in
+	user)
+		domain_source=$ARGUMENT
+		confirm_option=$OPTION
+		;;
+	all)
+		domain_source=$USER_INPUT
+		confirm_option=$ARGUMENT
+		[[ -z $OPTION ]] || fail "不支持的选项: $OPTION"
+		;;
+	*) fail "不支持的域名路由作用域: $scope" ;;
+	esac
+
+	[[ -n $domain_source ]] || fail "缺少域名列表文件或域名参数"
+	[[ -z $confirm_option || $confirm_option == --yes ]] || fail "不支持的选项: $confirm_option"
+	if [[ -e $domain_source ]]; then
+		[[ -f $domain_source && -r $domain_source ]] || fail "找不到可读的域名列表文件: $domain_source"
+		domain_input=$(<"$domain_source")
+		source_description="域名文件"
+	else
+		[[ $domain_source != */* ]] || fail "找不到可读的域名列表文件: $domain_source"
+		domain_input=${domain_source//,/$'\n'}
+		source_description="域名参数"
+	fi
+	if ! command -v getent >/dev/null 2>&1 && ! command -v dig >/dev/null 2>&1 && ! command -v nslookup >/dev/null 2>&1; then
 		fail "未找到域名解析命令，请安装 getent、dig 或 nslookup"
 	fi
 
-	normalize_user "$USER_INPUT"
-	[[ -f $CLIENT_CCD ]] || fail "找不到用户 CCD: $CLIENT_NAME"
+	if [[ $scope == user ]]; then
+		normalize_user "$USER_INPUT"
+		[[ -f $CLIENT_CCD ]] || fail "找不到用户 CCD: $CLIENT_NAME"
+		target_users+=("$CLIENT_NAME")
+		scope_description=$CLIENT_NAME
+		summary_label="待添加 IPv4"
+		completion_prefix="域名路由添加完成: $CLIENT_NAME"
+		partial_prefix="域名路由部分完成: $CLIENT_NAME"
+	else
+		for target_ccd in "$CCD_DIR"/*; do
+			[[ -f $target_ccd ]] || continue
+			target_users+=("$(basename "$target_ccd")")
+		done
+		((${#target_users[@]} > 0)) || fail "环境 $ENV_NAME 中没有 CCD 用户"
+		scope_description="环境 $ENV_NAME 的全部用户"
+		summary_label="待添加用户路由"
+		completion_prefix="全部用户域名路由添加完成: $ENV_NAME"
+		partial_prefix="全部用户域名路由部分完成: $ENV_NAME"
+	fi
 	require_running
-	log_start "解析域名路由: ${CLIENT_NAME}（环境: ${ENV_NAME}）"
+	log_start "解析域名路由: $scope_description"
 
 	while IFS= read -r raw_line || [[ -n $raw_line ]]; do
 		domain=${raw_line%%#*}
@@ -621,8 +717,8 @@ add_domain_routes() {
 		fi
 
 		log_info "解析域名: $domain"
-		resolved_ips=$(resolve_domain_ipv4 "$domain")
-		if [[ -z $resolved_ips ]]; then
+		resolved_output=$(resolve_domain_ipv4 "$domain")
+		if [[ -z $resolved_output ]]; then
 			log_info "域名未解析到 IPv4 地址: $domain"
 			failed_count=$((failed_count + 1))
 			continue
@@ -632,50 +728,99 @@ add_domain_routes() {
 		while IFS= read -r ip; do
 			[[ -n $ip ]] || continue
 			existing=false
-			for index in "${!pending_ips[@]}"; do
-				if [[ ${pending_ips[$index]} == "$ip" ]]; then
+			for index in "${!resolved_route_ips[@]}"; do
+				if [[ ${resolved_route_ips[$index]} == "$ip" ]]; then
 					existing=true
 					break
 				fi
 			done
 			if $existing; then
-				duplicate_count=$((duplicate_count + 1))
+				for target in "${target_users[@]}"; do
+					duplicate_users+=("$target")
+					duplicate_domains+=("$domain")
+					duplicate_ips+=("$ip")
+					duplicate_count=$((duplicate_count + 1))
+				done
 				continue
 			fi
-			pending_domains+=("$domain")
-			pending_ips+=("$ip")
-			pending_count=$((pending_count + 1))
-		done <<<"$resolved_ips"
-	done <"$domain_file"
+			resolved_domains+=("$domain")
+			resolved_route_ips+=("$ip")
+		done <<<"$resolved_output"
+	done <<<"$domain_input"
 
-	((pending_count > 0)) || fail \
-		"域名文件中没有可添加的 IPv4 路由（解析失败: ${failed_count}）"
-	log_info "待添加路由:"
-	for index in "${!pending_ips[@]}"; do
-		log_info "  ${pending_domains[$index]} -> ${pending_ips[$index]}"
+	for index in "${!resolved_route_ips[@]}"; do
+		ip=${resolved_route_ips[$index]}
+		domain=${resolved_domains[$index]}
+		route_line="push \"route $ip 255.255.255.255\""
+		for target in "${target_users[@]}"; do
+			target_ccd="$CCD_DIR/$target"
+			if grep -Fxq "$route_line" "$target_ccd"; then
+				duplicate_users+=("$target")
+				duplicate_domains+=("$domain")
+				duplicate_ips+=("$ip")
+				duplicate_count=$((duplicate_count + 1))
+			else
+				pending_users+=("$target")
+				pending_domains+=("$domain")
+				pending_ips+=("$ip")
+				pending_count=$((pending_count + 1))
+			fi
+		done
 	done
-	log_info "汇总: 解析域名 $resolved_count 个，待添加 IPv4 $pending_count 个，重复 $duplicate_count 个，失败 $failed_count 个"
 
-	if [[ $OPTION != --yes ]]; then
+	if ((pending_count > 0)); then
+		log_info "待添加路由:"
+		for index in "${!pending_ips[@]}"; do
+			if [[ $scope == all ]]; then
+				log_info "  ${pending_users[$index]}: ${pending_domains[$index]} -> ${pending_ips[$index]}/32"
+			else
+				log_info "  ${pending_domains[$index]} -> ${pending_ips[$index]}"
+			fi
+		done
+	fi
+	if ((duplicate_count > 0)); then
+		log_info "重复路由:"
+		for index in "${!duplicate_ips[@]}"; do
+			if [[ $scope == all ]]; then
+				log_info "  ${duplicate_users[$index]}: ${duplicate_domains[$index]} -> ${duplicate_ips[$index]}/32"
+			else
+				log_info "  ${duplicate_domains[$index]} -> ${duplicate_ips[$index]}/32"
+			fi
+		done
+	fi
+	log_info "汇总: 解析域名 $resolved_count 个，${summary_label} $pending_count 个，重复 $duplicate_count 个，失败 $failed_count 个"
+	if ((pending_count == 0)); then
+		if ((failed_count > 0 || duplicate_count == 0)); then
+			fail "${source_description}中没有可添加的 IPv4 路由（解析失败: ${failed_count}）"
+		fi
+		log_success "$completion_prefix，成功 0 个，重复 $duplicate_count 个"
+		return 0
+	fi
+
+	if [[ $confirm_option != --yes ]]; then
 		printf '是否继续添加以上路由? [y/N]: ' >&2
 		read -r answer || answer=""
 		case $answer in
-			y | Y | yes | YES | Yes) ;;
-			*) log_info "已取消域名路由添加"; return 0 ;;
+		y | Y | yes | YES | Yes) ;;
+		*)
+			log_info "已取消域名路由添加"
+			return 0
+			;;
 		esac
 	fi
 
-	for ip in "${pending_ips[@]}"; do
-		normalize_route "$ip"
-		add_route_for_user "$USER_INPUT"
+	for index in "${!pending_ips[@]}"; do
+		normalize_route "${pending_ips[$index]}"
+		add_route_for_user "${pending_users[$index]}"
 		success_count=$((success_count + 1))
 	done
 	if ((failed_count > 0)); then
-		fail "域名路由部分完成: ${CLIENT_NAME}，成功 $success_count 个，失败 $failed_count 个"
+		fail "$partial_prefix，成功 $success_count 个，失败 $failed_count 个"
 	fi
-	log_success "域名路由添加完成: ${CLIENT_NAME}，成功 $success_count 个，重复 $duplicate_count 个"
+	log_success "$completion_prefix，成功 $success_count 个，重复 $duplicate_count 个"
 }
 
+# 列出用户 CCD 中的静态路由和容器内的 ipset 路由。
 list_routes() {
 	normalize_user "$USER_INPUT"
 	[[ -f $CLIENT_CCD ]] || fail "找不到用户 CCD: $CLIENT_NAME"
@@ -688,6 +833,7 @@ list_routes() {
 	fi
 }
 
+# 为当前环境全部 CCD 用户批量添加或删除指定路由。
 route_all() {
 	local action=$1 ccd user count=0 action_name
 	normalize_route "$USER_INPUT"
@@ -706,6 +852,7 @@ route_all() {
 	log_success "批量路由操作完成: ${action_name} ${ROUTE_CIDR}，共处理 $count 个用户"
 }
 
+# 查询并格式化输出用户当前绑定的设备信息。
 list_hardware() {
 	normalize_user "$USER_INPUT"
 	log_info "查看用户 $CLIENT_NAME 的设备绑定信息"
@@ -723,6 +870,7 @@ list_hardware() {
     }' <<<"$record"
 }
 
+# 清空用户设备绑定字段，使其可在下次连接时重新绑定。
 delete_hardware() {
 	normalize_user "$USER_INPUT"
 	if ! awk -F', ' -v user="$CLIENT_NAME" '$1 == user { found = 1 } END { exit found ? 0 : 1 }' "$CLIENT_DB"; then
@@ -738,6 +886,7 @@ delete_hardware() {
 	list_hardware
 }
 
+# 从运行目录备份恢复容器内的 iptables 规则。
 reload_iptables() {
 	require_running
 	[[ -r $IPTABLES_BACKUP ]] || fail "找不到可读的 iptables 规则备份: $IPTABLES_BACKUP"
@@ -747,6 +896,7 @@ reload_iptables() {
 	log_success "iptables 规则恢复完成"
 }
 
+# 从运行目录备份恢复容器内的 ipset 规则。
 reload_ipset() {
 	require_running
 	[[ -r $IPSET_BACKUP ]] || fail "找不到可读的 ipset 规则备份: $IPSET_BACKUP"
@@ -756,6 +906,7 @@ reload_ipset() {
 	log_success "ipset 规则恢复完成"
 }
 
+# 调用维护脚本备份宿主机网络策略。
 backup_host_network() {
 	local backup_script="$LOCAL_PATH/maintenance/backup-host-network.sh"
 	[[ -x $backup_script ]] || fail "找不到可执行的宿主机网络策略备份脚本: $backup_script"
@@ -764,6 +915,7 @@ backup_host_network() {
 	log_success "宿主机网络策略备份完成: $LOCAL_PATH/state"
 }
 
+# 启动 OpenVPN Compose 服务并备份宿主机网络策略。
 start_service() {
 	log_start "启动 VPN Server: $CONTAINER_NAME"
 	compose_cmd up -d
@@ -771,12 +923,14 @@ start_service() {
 	log_success "VPN Server 启动完成: $CONTAINER_NAME"
 }
 
+# 停止 OpenVPN Compose 服务并保留容器和运行目录。
 stop_service() {
 	log_start "停止 VPN Server: $CONTAINER_NAME"
 	compose_cmd stop
 	log_success "VPN Server 已停止: $CONTAINER_NAME"
 }
 
+# 备份运行目录后重建 OpenVPN Compose 服务。
 restart_service() {
 	local backup_path
 	backup_path="$LOCAL_PATH-$(date '+%Y_%m%d_%H%M_%S')"
@@ -790,6 +944,7 @@ restart_service() {
 	log_success "VPN Server 重建完成: ${CONTAINER_NAME}（备份: ${backup_path}）"
 }
 
+# 显示 OpenVPN Compose 状态和最近的容器日志。
 show_status() {
 	log_info "查看 VPN Server 状态: $CONTAINER_NAME"
 	compose_cmd ps
@@ -823,19 +978,19 @@ resetotp | -ro)
 	load_env
 	reset_otp
 	;;
-addpassuser | -apu)
+addpass | -ap)
 	load_env
 	add_password_user
 	;;
-delpassuser | -dpu)
+delpass | -dp)
 	load_env
 	delete_password_user
 	;;
-chpassuser | -cpu)
+chpass | -cp)
 	load_env
 	change_password_user
 	;;
-listpassuser | -lpu)
+listpass | -lp)
 	load_env
 	list_password_users
 	;;
@@ -855,7 +1010,11 @@ delroute | -dr)
 	;;
 adddomainroute | -adr)
 	load_env
-	add_domain_routes
+	add_domain_routes user
+	;;
+adddomainrouteall | -adra)
+	load_env
+	add_domain_routes all
 	;;
 addrouteall | -ara)
 	load_env
