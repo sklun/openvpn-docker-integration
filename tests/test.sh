@@ -30,6 +30,42 @@ if bash "$PROJECT_ROOT/deploy/install.sh" >/dev/null 2>&1; then
     exit 1
 fi
 
+echo "+ CIDR and mask conversion"
+(
+    set -- help
+    # shellcheck source=/dev/null
+    source "$PROJECT_ROOT/deploy/ovpn" >/dev/null
+
+    for prefix in {0..32}; do
+        mask=$(cidr_to_mask "$prefix")
+        converted_prefix=$(mask_to_cidr "$mask")
+        if [[ $converted_prefix != "$prefix" ]]; then
+            echo "CIDR round trip failed: $prefix -> $mask -> $converted_prefix" >&2
+            exit 1
+        fi
+    done
+
+    for prefix in -1 33 01 abc ""; do
+        if cidr_to_mask "$prefix" >/dev/null; then
+            echo "invalid CIDR prefix unexpectedly accepted: $prefix" >&2
+            exit 1
+        fi
+    done
+
+    for mask in \
+        255.255.0 \
+        255.255.255.255.0 \
+        255.255.127.0 \
+        255.0.255.0 \
+        255.254.128.0 \
+        255.255.255.1; do
+        if mask_to_cidr "$mask" >/dev/null; then
+            echo "invalid subnet mask unexpectedly accepted: $mask" >&2
+            exit 1
+        fi
+    done
+)
+
 echo "+ Non-interactive PKI and OTP ownership safeguards"
 grep -Fq 'easyrsa --batch build-ca' "$PROJECT_ROOT/server/bin/ovpn_initpki"
 grep -Fq 'easyrsa --batch build-server-full' "$PROJECT_ROOT/server/bin/ovpn_initpki"
@@ -138,6 +174,12 @@ case ${2:-} in
     api.test)
         printf '10.30.0.10 STREAM api.test\n10.30.0.11 STREAM api.test\n'
         ;;
+    direct.test)
+        printf '10.30.0.13 STREAM direct.test\n'
+        ;;
+    direct-api.test)
+        printf '10.30.0.14 STREAM direct-api.test\n'
+        ;;
     cancel.test)
         printf '10.30.0.12 STREAM cancel.test\n'
         ;;
@@ -176,7 +218,7 @@ touch "$password_runtime/auth/static-password-users" "$password_runtime/auth/sta
 password_log="$TEST_ROOT/password-command.log"
 
 OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
-	addpassuser test alice first-secret >/dev/null 2>"$password_log"
+	addpass test alice first-secret >/dev/null 2>"$password_log"
 grep -Fq '+ 添加固定密码用户: alice-test' "$password_log"
 grep -Fq '* 固定密码用户添加完成: alice-test' "$password_log"
 if grep -Fq 'first-secret' "$password_log"; then
@@ -187,7 +229,7 @@ grep -Fxq 'alice-test' "$password_runtime/auth/static-password-users"
 grep -Fxq 'alice-test:first-secret' "$password_runtime/auth/static-passwords"
 
 OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
-	chpassuser test alice second-secret >/dev/null 2>"$password_log"
+	chpass test alice second-secret >/dev/null 2>"$password_log"
 grep -Fq '+ 修改固定密码用户密码: alice-test' "$password_log"
 grep -Fq '* 固定密码修改完成: alice-test' "$password_log"
 if grep -Fq 'second-secret' "$password_log"; then
@@ -200,11 +242,11 @@ if grep -Fq 'first-secret' "$password_runtime/auth/static-passwords"; then
     exit 1
 fi
 
-listed=$(OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" listpassuser test)
+listed=$(OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" listpass test)
 [[ $listed == 'alice-test' ]]
 
 OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
-    delpassuser test alice >/dev/null
+    delpass test alice >/dev/null
 [[ ! -s $password_runtime/auth/static-password-users ]]
 [[ ! -s $password_runtime/auth/static-passwords ]]
 
@@ -261,10 +303,32 @@ EOF
 domain_log="$TEST_ROOT/domain-command.log"
 OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
     adddomainroute test alice "$domain_file" --yes >/dev/null 2>"$domain_log"
+grep -Fq '|   api.test -> 10.30.0.10/32' "$domain_log"
 grep -Fq '| 汇总: 解析域名 2 个，待添加 IPv4 2 个，重复 1 个，失败 0 个' "$domain_log"
 grep -Fq '* 域名路由添加完成: alice-test，成功 2 个，重复 1 个' "$domain_log"
 grep -Fxq 'push "route 10.30.0.10 255.255.255.255"' "$password_runtime/ccd/alice-test"
 grep -Fxq 'push "route 10.30.0.11 255.255.255.255"' "$password_runtime/ccd/alice-test"
+
+OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
+    adddomainroute test alice 'direct.test, direct-api.test' --yes >/dev/null 2>"$domain_log"
+grep -Fq '| 汇总: 解析域名 2 个，待添加 IPv4 2 个，重复 0 个，失败 0 个' "$domain_log"
+grep -Fq '* 域名路由添加完成: alice-test，成功 2 个，重复 0 个' "$domain_log"
+grep -Fxq 'push "route 10.30.0.13 255.255.255.255"' "$password_runtime/ccd/alice-test"
+grep -Fxq 'push "route 10.30.0.14 255.255.255.255"' "$password_runtime/ccd/alice-test"
+
+OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
+    adddomainroute test alice 'direct.test,direct-api.test' </dev/null >/dev/null 2>"$domain_log"
+grep -Fq '| 重复路由:' "$domain_log"
+grep -Fq '|   direct.test -> 10.30.0.13/32' "$domain_log"
+grep -Fq '|   direct-api.test -> 10.30.0.14/32' "$domain_log"
+grep -Fq '| 汇总: 解析域名 2 个，待添加 IPv4 0 个，重复 2 个，失败 0 个' "$domain_log"
+grep -Fq '* 域名路由添加完成: alice-test，成功 0 个，重复 2 个' "$domain_log"
+if grep -Eq '待添加路由:|是否继续添加以上路由' "$domain_log"; then
+    echo "existing domain routes unexpectedly requested confirmation" >&2
+    exit 1
+fi
+[[ $(grep -Fxc 'push "route 10.30.0.13 255.255.255.255"' "$password_runtime/ccd/alice-test") -eq 1 ]]
+[[ $(grep -Fxc 'push "route 10.30.0.14 255.255.255.255"' "$password_runtime/ccd/alice-test") -eq 1 ]]
 
 printf 'cancel.test\n' >"$domain_file"
 printf 'n\n' | OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
