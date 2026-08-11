@@ -2,6 +2,8 @@
 
 基于 Shell 脚本和 Docker Compose 的 OpenVPN 服务集成方案，提供镜像构建、环境部署、用户与证书管理、多种认证方式、客户端路由及日常维护能力。
 
+`server/` 相关脚本基于 [kylemanna/docker-openvpn](https://github.com/kylemanna/docker-openvpn) 开发。
+
 ## 功能
 
 - 按环境部署相互隔离的 OpenVPN 实例
