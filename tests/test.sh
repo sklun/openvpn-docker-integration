@@ -25,7 +25,7 @@ grep -Fq 'adddomainrouteall' <<<"$help_output"
 grep -Fq '| -adra' <<<"$help_output"
 grep -Fq '服务与规则:' <<<"$help_output"
 grep -Fq 'backuphostnetwork' <<<"$help_output"
-grep -Fq '非 LDAP 模式会自动追加 -<env>' <<<"$help_output"
+grep -Fq 'OVPN_USER_SUFFIX 可覆盖该后缀' <<<"$help_output"
 grep -Fq '密码、OTP 密钥、私钥或 LDAP 凭据' <<<"$help_output"
 if bash "$PROJECT_ROOT/deploy/install.sh" >/dev/null 2>&1; then
     echo "install.sh unexpectedly succeeded without arguments" >&2
@@ -84,6 +84,12 @@ grep -Fq 'file=/etc/openvpn/auth/static-password-users' "$PROJECT_ROOT/server/ot
 grep -Fq 'file="@OPENVPN@/logs/iptables.log"' "$PROJECT_ROOT/deploy/config/ulogd.conf"
 grep -Fq 'maintenance/backup-host-network.sh' "$PROJECT_ROOT/deploy/install.sh"
 grep -Fq 'require_command iptables-save' "$PROJECT_ROOT/deploy/install.sh"
+grep -Eq '^[[:space:]]+libqrencode-tools \\' "$PROJECT_ROOT/server/Dockerfile"
+grep -Fq 'ln -sf xtables-nft-multi "/usr/sbin/${command}"' "$PROJECT_ROOT/server/Dockerfile"
+if grep -Fq 'ln -sf xtables-nft-multi "/sbin/${command}"' "$PROJECT_ROOT/server/Dockerfile"; then
+    echo "broken /sbin xtables link remains in Dockerfile" >&2
+    exit 1
+fi
 # shellcheck disable=SC2016  # Matching literal source text.
 if grep -R -E 'OVPN_SCRIPTS_PATH|(/etc/openvpn|\$OPENVPN|\$\{OPENVPN\})/(scripts|tools)([^[:alnum:]_.-]|$)' \
     "$PROJECT_ROOT/server" "$PROJECT_ROOT/deploy" >/dev/null; then
@@ -201,6 +207,46 @@ if [ "${MOCK_DOCKER_FAIL:-0}" = 1 ]; then
 fi
 if [ "${1:-}" = inspect ]; then
     printf 'true\n'
+    exit 0
+fi
+if [ "${MOCK_CREATE_USER_OTP_FAIL:-0}" = 1 ]; then
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            easyrsa)
+                shift
+                [ "${1:-}" = --batch ] && shift
+                if [ "${1:-}" = build-client-full ]; then
+                    client=$2
+                    mkdir -p "$MOCK_RUNTIME/pki/issued" "$MOCK_RUNTIME/pki/private" \
+                        "$MOCK_RUNTIME/pki/reqs"
+                    touch "$MOCK_RUNTIME/pki/issued/$client.crt" \
+                        "$MOCK_RUNTIME/pki/private/$client.key" \
+                        "$MOCK_RUNTIME/pki/reqs/$client.req"
+                fi
+                exit 0
+                ;;
+            ovpn_getclient)
+                client=$2
+                mkdir -p "$MOCK_RUNTIME/clients/$client"
+                touch "$MOCK_RUNTIME/clients/$client/$client-test.ovpn"
+                exit 0
+                ;;
+            ovpn_otp_user)
+                client=$2
+                mkdir -p "$MOCK_RUNTIME/otp"
+                printf 'TEST-SECRET\n' >"$MOCK_RUNTIME/otp/$client.google_authenticator"
+                exit 31
+                ;;
+            ovpn_revokeclient)
+                client=$2
+                rm -f "$MOCK_RUNTIME/pki/issued/$client.crt" \
+                    "$MOCK_RUNTIME/pki/private/$client.key" \
+                    "$MOCK_RUNTIME/pki/reqs/$client.req"
+                exit 0
+                ;;
+        esac
+        shift
+    done
 fi
 exit 0
 EOF
@@ -263,6 +309,34 @@ touch "$password_runtime/pki/issued/alice-test.crt"
 touch "$password_runtime/auth/static-password-users" "$password_runtime/auth/static-passwords"
 password_log="$TEST_ROOT/password-command.log"
 
+echo "+ Failed user creation rollback"
+mkdir -p "$password_runtime/clients" "$password_runtime/ccd" "$password_runtime/otp" \
+	"$password_runtime/pki/private" "$password_runtime/pki/reqs" \
+	"$password_runtime/pki/inline/private"
+touch "$password_runtime/state/client-ips.csv" "$password_runtime/state/client-ip-history.csv"
+if MOCK_CREATE_USER_OTP_FAIL=1 MOCK_RUNTIME="$password_runtime" \
+	OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
+	createuser test rollback >/dev/null 2>"$password_log"; then
+	echo "failed OTP user creation unexpectedly succeeded" >&2
+	exit 1
+fi
+grep -Fq '| 用户创建失败，回滚已生成资源: rollback-test' "$password_log"
+grep -Fq '| 用户创建回滚完成: rollback-test' "$password_log"
+for path in \
+	"$password_runtime/pki/issued/rollback-test.crt" \
+	"$password_runtime/pki/private/rollback-test.key" \
+	"$password_runtime/pki/reqs/rollback-test.req" \
+	"$password_runtime/clients/rollback-test" \
+	"$password_runtime/ccd/rollback-test" \
+	"$password_runtime/otp/rollback-test.google_authenticator"; do
+	[[ ! -e $path ]]
+done
+if grep -Fq 'rollback-test' "$password_runtime/state/client-ips.csv" \
+	|| grep -Fq 'rollback-test' "$password_runtime/state/client-ip-history.csv"; then
+	echo "failed user creation left client state behind" >&2
+	exit 1
+fi
+
 OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
 	addpass test alice first-secret >/dev/null 2>"$password_log"
 grep -Fq '+ 添加固定密码用户: alice-test' "$password_log"
@@ -295,6 +369,17 @@ OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
     delpass test alice >/dev/null
 [[ ! -s $password_runtime/auth/static-password-users ]]
 [[ ! -s $password_runtime/auth/static-passwords ]]
+
+echo "+ Configurable certificate user suffix"
+sed -i 's|^OVPN_USER_SUFFIX=.*|OVPN_USER_SUFFIX="legacy"|' "$password_runtime/ovpn.env"
+touch "$password_runtime/pki/issued/alice-legacy.crt"
+OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
+	addpass test alice suffix-secret >/dev/null 2>"$password_log"
+grep -Fxq 'alice-legacy' "$password_runtime/auth/static-password-users"
+grep -Fxq 'alice-legacy:suffix-secret' "$password_runtime/auth/static-passwords"
+OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
+	delpass test alice-legacy >/dev/null
+sed -i 's|^OVPN_USER_SUFFIX=.*|OVPN_USER_SUFFIX=""|' "$password_runtime/ovpn.env"
 
 echo "+ Service lifecycle logs"
 service_log="$TEST_ROOT/service-command.log"

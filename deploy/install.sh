@@ -116,6 +116,10 @@ validate_config() {
 		[[ -n ${LDAP_BIND_DN:-} ]] || fail "LDAP_BIND_DN is required when LDAP=true"
 		[[ -n ${LDAP_BASE_DN:-} ]] || fail "LDAP_BASE_DN is required when LDAP=true"
 	fi
+	if [[ -n ${OVPN_USER_SUFFIX:-} ]]; then
+		[[ $OVPN_USER_SUFFIX =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || \
+			fail "OVPN_USER_SUFFIX contains unsupported characters"
+	fi
 }
 
 confirm_config() {
@@ -129,6 +133,7 @@ VPC subnet:      $OVPN_VPC_SUBNET
 OTP:             ${OTP:-false}
 Password auth:   ${PASSWORD_AUTH:-false}
 LDAP:            ${LDAP:-false}
+User suffix:     ${OVPN_USER_SUFFIX:-$SERVER_ENV}
 Device binding:  ${DEVICE_AUTH:-false}
 Auto revoke:     ${AUTO_REVOKE:-false}
 EOF

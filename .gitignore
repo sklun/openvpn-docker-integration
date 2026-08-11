@@ -1,4 +1,5 @@
 *.tar.gz
+*.tar
 .DS_Store
 test-results/
 .idea/

@@ -58,7 +58,8 @@ usage() {
 	env      环境名，仅允许字母、数字、下划线和连字符。默认运行目录为
 			/opt/openvpn-<env>，可通过 OVPN_RUNTIME_ROOT 修改 /opt 前缀。
 	user     必须以字母开头，可包含字母、数字、点、下划线和连字符。
-			非 LDAP 模式会自动追加 -<env>；归一化后最长 31 个字符。
+			非 LDAP 模式默认追加 -<env>，OVPN_USER_SUFFIX 可覆盖该后缀；
+			归一化后最长 31 个字符。
 	route    支持单个 IPv4（如 10.0.6.1）或 IPv4 CIDR（如 10.0.6.0/24）。
 	source   可读域名列表文件，或单个域名/以英文逗号分隔的多个域名。
 			文件支持每行一个域名、空行和 # 注释。
@@ -295,13 +296,15 @@ mask_to_cidr() {
 
 # 校验并按环境规则归一化用户名及其关联路径。
 normalize_user() {
-	local raw=$1
+	local raw=$1 user_suffix
 	[[ -n $raw ]] || fail "缺少用户名"
 	[[ $raw =~ ^[a-zA-Z][a-zA-Z0-9._-]*$ ]] || fail "用户名格式不正确: $raw"
-	if is_true "${LDAP:-false}" || [[ $raw == *-"$ENV_NAME" ]]; then
+	user_suffix=${OVPN_USER_SUFFIX:-$ENV_NAME}
+	[[ $user_suffix =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || fail "用户后缀格式不正确: $user_suffix"
+	if is_true "${LDAP:-false}" || [[ $raw == *-"$user_suffix" ]]; then
 		CLIENT_NAME=$raw
 	else
-		CLIENT_NAME="$raw-$ENV_NAME"
+		CLIENT_NAME="$raw-$user_suffix"
 	fi
 	((${#CLIENT_NAME} <= 31)) || fail "归一化后的用户名超过 ipset 的 31 字符限制: $CLIENT_NAME"
 	IPSET_NAME=$CLIENT_NAME
@@ -410,23 +413,61 @@ create_access_rules() {
 	save_rules
 }
 
+# 回滚创建失败的用户，避免遗留不可用证书、状态记录和访问规则。
+rollback_created_user() {
+	local exit_code=$1 line_number=$2 client_ip
+	trap - ERR
+	set +e
+	log_info "用户创建失败，回滚已生成资源: $CLIENT_NAME"
+
+	client_ip=$(awk -F', ' -v user="$CLIENT_NAME" '$1 == user { print $2; exit }' "$CLIENT_DB")
+	if container_running; then
+		if [[ -n $client_ip ]]; then
+			docker exec "$CONTAINER_NAME" iptables -D FORWARD -s "$client_ip" \
+				-m set --match-set "$IPSET_NAME" dst -m comment \
+				--comment "allow $CLIENT_NAME route group" -j ACCEPT >/dev/null 2>&1 || true
+		fi
+		docker exec "$CONTAINER_NAME" ipset destroy "$IPSET_NAME" >/dev/null 2>&1 || true
+		save_rules >/dev/null 2>&1 || true
+	fi
+
+	if [[ -f $LOCAL_PATH/pki/private/$CLIENT_NAME.key ]]; then
+		docker run --rm -i -v "$LOCAL_PATH:$OPENVPN" -e "OPENVPN=$OPENVPN" \
+			"$OVPN_IMAGE" ovpn_revokeclient "$CLIENT_NAME" remove >/dev/null 2>&1 || true
+	fi
+	rm -rf "$CLIENT_OUTPUT"
+	rm -f \
+		"$CLIENT_CCD" \
+		"$LOCAL_PATH/otp/$CLIENT_NAME.google_authenticator" \
+		"$LOCAL_PATH/pki/private/$CLIENT_NAME.key" \
+		"$LOCAL_PATH/pki/issued/$CLIENT_NAME.crt" \
+		"$LOCAL_PATH/pki/reqs/$CLIENT_NAME.req" \
+		"$LOCAL_PATH/pki/inline/private/$CLIENT_NAME.inline"
+	atomic_without_user "$CLIENT_DB" "$CLIENT_NAME" csv
+	atomic_without_user "$CLIENT_HISTORY" "$CLIENT_NAME" csv
+	remove_password_user "$CLIENT_NAME"
+	set_runtime_ownership
+	log_info "用户创建回滚完成: $CLIENT_NAME"
+	handle_error "$exit_code" "$line_number"
+}
+
 # 创建证书用户、客户端配置、固定 IP、访问规则和可选 OTP。
 create_user() {
 	normalize_user "$USER_INPUT"
 	[[ ! -f $CLIENT_CERT ]] || fail "用户已存在: $CLIENT_NAME"
 	require_running
+	if is_true "${OTP:-false}"; then
+		docker run --rm "$OVPN_IMAGE" sh -c \
+			'command -v google-authenticator >/dev/null && command -v qrencode >/dev/null'
+	fi
 	log_start "创建 VPN 用户: ${CLIENT_NAME}（环境: ${ENV_NAME}）"
 	log_info "生成客户端证书和配置"
+	trap 'rollback_created_user "$?" "$LINENO"' ERR
 
 	docker run --rm -v "$LOCAL_PATH:$OPENVPN" -e "OPENVPN=$OPENVPN" \
 		"$OVPN_IMAGE" easyrsa --batch build-client-full "$CLIENT_NAME" nopass
 	docker run --rm -v "$LOCAL_PATH:$OPENVPN" -e "OPENVPN=$OPENVPN" \
 		"$OVPN_IMAGE" ovpn_getclient "$CLIENT_NAME" combined-save -e push-peer-info
-
-	log_info "分配固定 IP 并写入访问规则"
-	cp "$DEFAULT_CCD" "$CLIENT_CCD"
-	assign_client_ip
-	create_access_rules
 
 	if is_true "${OTP:-false}"; then
 		log_info "生成 OTP 密钥（密钥仅输出到用户文件和当前命令结果）"
@@ -434,7 +475,13 @@ create_user() {
 		docker run --rm -i -v "$LOCAL_PATH:$OPENVPN" -e "OPENVPN=$OPENVPN" \
 			"$OVPN_IMAGE" ovpn_otp_user "$CLIENT_NAME" | tee "$CLIENT_OUTPUT/$CLIENT_NAME-otpinfo"
 	fi
+
+	log_info "分配固定 IP 并写入访问规则"
+	cp "$DEFAULT_CCD" "$CLIENT_CCD"
+	assign_client_ip
+	create_access_rules
 	set_runtime_ownership
+	trap 'handle_error "$?" "$LINENO"' ERR
 	log_success "用户创建完成: ${CLIENT_NAME}（客户端 IP: ${CLIENT_IP}）"
 	ls -1 "$CLIENT_OUTPUT"/*.ovpn
 }
