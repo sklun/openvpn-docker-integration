@@ -11,6 +11,7 @@
 - 用户证书签发、续期、吊销和客户端配置导出
 - CCD 静态地址、用户路由、全局路由和域名路由
 - 客户端硬件地址绑定
+- 自适应 iptables-nft、iptables-legacy 和经典 iptables 访问控制
 - 容器规则重载与宿主机 iptables 网络策略备份
 - 日志轮转和不活跃客户端清理
 - 离线部署包生成
@@ -115,6 +116,56 @@ ${EDITOR:-vi} ovpn.env
 
 常用配置项包括镜像名称、服务端地址、VPN 网段、DNS、认证模式、LDAP 连接、路由和日志策略。具体变量及默认值以 [deploy/ovpn.env.example](deploy/ovpn.env.example) 为准。
 
+`OVPN_IPTABLES_BACKEND` 控制容器内的规则后端：
+
+| 值 | 行为 |
+| --- | --- |
+| `auto` | 启动时实际创建临时链和 ipset 规则进行探测，优先沿用已选后端，否则依次尝试 nft、legacy |
+| `nft` | 强制使用 `iptables-nft` 系列命令，探测失败时拒绝启动 |
+| `legacy` | 优先使用 `iptables-legacy`，在没有后端区分的系统中使用经典 `iptables` 命令 |
+
+探测会按已启用功能校验 `set`、`comment`、NFLOG、NAT/MASQUERADE 等扩展，临时规则随后清理。选中的后端记录在 `state/iptables.backend`。启动和 `ovpn syncrules` 都以环境配置、`state/client-ips.csv` 和 CCD 为事实标准，清理容器内旧规则后完整重建。`state/iptables.rules`、`state/iptables.rules.backend` 和 `state/ipset.rules` 会在重建及规则变更后刷新，仅作为审计和故障取证快照，不用于恢复运行状态。容器能否使用相应后端最终仍由宿主机内核及容器授予的网络能力决定。
+
+日常的 `addroute`、`delroute`、域名路由和全用户路由命令只增量修改对应用户的 ipset，不重建 iptables 或其他用户集合；一批路由只执行一次容器更新和快照。若增量更新失败，管理命令会回滚本次 CCD 修改并执行一次全量同步纠偏。`syncrules` 主要用于启动、NAT/策略配置变更、手工修改 CCD 后同步，以及运行状态纠偏。
+
+启用 `IPTABLES_POLICY` 后，每个用户的 CCD 路由会同步到独立 ipset。所有从 `tun0` 转发的目标地址都必须命中该用户的 ipset，否则会被最终 DROP 规则拒绝。需要访问公网地址时，也必须通过用户路由或域名路由将目标加入白名单。
+
+### NAT 与源地址
+
+`OVPN_NAT` 独立控制 VPN 客户端网段的 MASQUERADE，`OVPN_DEFROUTE` 只控制是否向客户端下发默认路由，两者不会互相隐式启用。容器内 `POSTROUTING` 链的 MASQUERADE 由本项目统一重建，规则仅以 `OVPN_CLIENT_SUBNET` 为源地址；`OVPN_ROUTES` 是客户端访问的目标网段，不参与源 NAT。需要额外 NAT 行为时应使用独立 SNAT 规则，避免手工 MASQUERADE 被同步清理。
+
+| 场景 | 配置 | 目的端看到的源地址 | 网络要求 |
+| --- | --- | --- | --- |
+| 常规远程接入或全流量代理 | `OVPN_NAT=true` | VPN Server 或 Docker 主机的出口地址 | 通常不需要为 VPN 客户端网段增加回程路由 |
+| 内网需要识别具体 VPN 客户端 | `OVPN_NAT=false` | 客户端隧道地址，例如 `10.8.0.2` | 目的网络必须能将 `OVPN_CLIENT_SUBNET` 路由回 OpenVPN 容器 |
+| 获取客户端接入 VPN 前的公网地址 | 任意 | 无法通过三层转发直接获得 | 使用 OpenVPN 连接日志做身份映射，或由应用代理传递可信源地址 |
+
+在默认 Docker bridge 部署中关闭 NAT 前，应确保 Docker 主机已开启 IPv4 转发，并配置两段回程路径：目的网络的网关将 `OVPN_CLIENT_SUBNET` 指向 Docker 主机的内网地址，Docker 主机再将该网段指向 OpenVPN 容器地址。容器地址可查询：
+
+```shell
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' openvpn-production
+```
+
+以下示例假设 VPN 客户端网段为 `10.8.0.0/24`、Docker 主机内网地址为 `192.168.1.10`、OpenVPN 容器地址为 `172.20.0.2`：
+
+```shell
+# 在目的网络网关上执行，具体命令按网关系统调整。
+ip route replace 10.8.0.0/24 via 192.168.1.10
+
+# 在 Docker 主机上执行。
+ip route replace 10.8.0.0/24 via 172.20.0.2
+```
+
+Compose 重建后容器地址可能变化。生产环境应固定容器地址，或在每次重建后更新 Docker 主机上的回程路由；同时确认宿主机防火墙允许该转发路径。
+
+确认回程路由后，编辑运行配置 `/opt/openvpn-production/ovpn.env`，设置 `OVPN_NAT=false`，然后只同步 iptables：
+
+```shell
+ovpn syncrules production
+```
+
+恢复 NAT 时设置 `OVPN_NAT=true` 并再次执行相同命令。若容器出口设备不是 `eth0`，同时设置 `OVPN_NATDEVICE`。修改 `OVPN_DEFROUTE` 后需要执行 `ovpn restart production`，因为该选项会改变下发给客户端的 OpenVPN 配置。
+
 认证模式必须使用以下有效组合之一：
 
 | OTP | 固定密码 | LDAP | 行为 |
@@ -216,8 +267,7 @@ ovpn adddomainrouteall production example.com,api.example.com --yes
 | `ovpn stop ENV` | 停止环境 |
 | `ovpn status ENV` | 查看状态 |
 | `ovpn restart ENV` | 备份配置后重建服务 |
-| `ovpn reloadipset ENV` | 重新加载 ipset |
-| `ovpn reloadiptables ENV` | 重新加载 iptables |
+| `ovpn syncrules ENV` | 根据环境配置、用户状态和 CCD 重建 iptables/ipset |
 | `ovpn backuphostnetwork ENV` | 刷新宿主机 iptables 网络策略备份 |
 
 安装、`start` 和 `restart` 会在 Docker 网络就绪后自动刷新宿主机网络策略快照。

@@ -49,8 +49,7 @@ usage() {
 	stop             <env>  停止 VPN Server，保留容器和运行目录
 	status           <env>  查看 Compose 状态和最近 100 行容器日志
 	restart          <env>  备份运行目录后重建 VPN Server
-	reloadipset      <env>  从运行目录备份恢复 ipset 规则
-	reloadiptables   <env>  从运行目录备份恢复 iptables 规则
+	syncrules        <env>  根据当前配置、用户状态和 CCD 重建防火墙规则
 	backuphostnetwork <env> 备份宿主机 iptables 网络策略
 	help | -h               显示本帮助
 
@@ -145,8 +144,6 @@ load_env() {
 	CLIENT_HISTORY="$LOCAL_PATH/state/client-ip-history.csv"
 	CCD_DIR="$LOCAL_PATH/ccd"
 	CLIENT_DIR="$LOCAL_PATH/clients"
-	IPTABLES_BACKUP="$LOCAL_PATH/state/iptables.rules"
-	IPSET_BACKUP="$LOCAL_PATH/state/ipset.rules"
 	PASSWORD_USERS_FILE="$LOCAL_PATH/auth/static-password-users"
 	PASSWORD_FILE="$LOCAL_PATH/auth/static-passwords"
 	DEFAULT_CCD="$LOCAL_PATH/templates/ccd/default"
@@ -266,34 +263,6 @@ cidr_to_mask() {
 	printf '%s\n' "$output"
 }
 
-# 将点分十进制子网掩码转换为 CIDR 前缀长度。
-mask_to_cidr() {
-	local mask=$1 octet octet_bits bits=0 finished=0
-	local -a octets
-	[[ $mask =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-	IFS=. read -r -a octets <<<"$mask"
-	((${#octets[@]} == 4)) || return 1
-
-	for octet in "${octets[@]}"; do
-		case $octet in
-		255) octet_bits=8 ;;
-		254) octet_bits=7 ;;
-		252) octet_bits=6 ;;
-		248) octet_bits=5 ;;
-		240) octet_bits=4 ;;
-		224) octet_bits=3 ;;
-		192) octet_bits=2 ;;
-		128) octet_bits=1 ;;
-		0) octet_bits=0 ;;
-		*) return 1 ;;
-		esac
-		((finished == 0 || octet_bits == 0)) || return 1
-		bits=$((bits + octet_bits))
-		((octet_bits == 8)) || finished=1
-	done
-	printf '%d\n' "$bits"
-}
-
 # 校验并按环境规则归一化用户名及其关联路径。
 normalize_user() {
 	local raw=$1 user_suffix
@@ -347,13 +316,6 @@ atomic_without_user() {
 	secure_file "$file"
 }
 
-# 将容器内当前 iptables 和 ipset 规则保存到运行目录。
-save_rules() {
-	require_running
-	docker exec "$CONTAINER_NAME" sh -c 'iptables-save > "$1/state/iptables.rules"' sh "$OPENVPN"
-	docker exec "$CONTAINER_NAME" sh -c 'ipset save > "$1/state/ipset.rules"' sh "$OPENVPN"
-}
-
 # 为用户分配未占用的固定 IP，并同步状态记录和 CCD。
 assign_client_ip() {
 	local first last candidate candidate_ip prefix mask lock_file
@@ -385,51 +347,20 @@ assign_client_ip() {
 	fail "客户端网段没有可用地址: $OVPN_CLIENT_SUBNET"
 }
 
-# 为用户创建 ipset、iptables 访问规则并导入 CCD 路由。
+# 根据当前用户状态和 CCD 重建访问规则。
 create_access_rules() {
-	local route ip mask prefix insert_line
 	require_running
-	log_info "创建用户访问规则: $CLIENT_NAME"
-	docker exec "$CONTAINER_NAME" ipset create "$IPSET_NAME" hash:net -exist
-	if ! docker exec "$CONTAINER_NAME" iptables -C FORWARD -s "$CLIENT_IP" -m set --match-set "$IPSET_NAME" dst \
-		-m comment --comment "allow $CLIENT_NAME route group" -j ACCEPT 2>/dev/null; then
-		insert_line=$(docker exec "$CONTAINER_NAME" sh -c \
-			"iptables -nvL FORWARD --line-numbers | awk '/reject all vpc subnet/ {print \$1; exit}'")
-		if [[ -n $insert_line ]]; then
-			docker exec "$CONTAINER_NAME" iptables -I FORWARD "$insert_line" -s "$CLIENT_IP" \
-				-m set --match-set "$IPSET_NAME" dst -m comment --comment "allow $CLIENT_NAME route group" -j ACCEPT
-		else
-			docker exec "$CONTAINER_NAME" iptables -A FORWARD -s "$CLIENT_IP" \
-				-m set --match-set "$IPSET_NAME" dst -m comment --comment "allow $CLIENT_NAME route group" -j ACCEPT
-		fi
-	fi
-
-	while read -r ip mask; do
-		[[ -n ${ip:-} && -n ${mask:-} ]] || continue
-		prefix=$(mask_to_cidr "$mask") || fail "用户 CCD 中的子网掩码无效: $mask"
-		route="$ip/$prefix"
-		docker exec "$CONTAINER_NAME" ipset add "$IPSET_NAME" "$route" -exist
-	done < <(awk '/^push "route / { gsub(/"/, ""); print $3, $4 }' "$CLIENT_CCD")
-	save_rules
+	log_info "根据当前用户状态重建访问规则"
+	docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
+		"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd"
 }
 
 # 回滚创建失败的用户，避免遗留不可用证书、状态记录和访问规则。
 rollback_created_user() {
-	local exit_code=$1 line_number=$2 client_ip
+	local exit_code=$1 line_number=$2
 	trap - ERR
 	set +e
 	log_info "用户创建失败，回滚已生成资源: $CLIENT_NAME"
-
-	client_ip=$(awk -F', ' -v user="$CLIENT_NAME" '$1 == user { print $2; exit }' "$CLIENT_DB")
-	if container_running; then
-		if [[ -n $client_ip ]]; then
-			docker exec "$CONTAINER_NAME" iptables -D FORWARD -s "$client_ip" \
-				-m set --match-set "$IPSET_NAME" dst -m comment \
-				--comment "allow $CLIENT_NAME route group" -j ACCEPT >/dev/null 2>&1 || true
-		fi
-		docker exec "$CONTAINER_NAME" ipset destroy "$IPSET_NAME" >/dev/null 2>&1 || true
-		save_rules >/dev/null 2>&1 || true
-	fi
 
 	if [[ -f $LOCAL_PATH/pki/private/$CLIENT_NAME.key ]]; then
 		docker run --rm -i -v "$LOCAL_PATH:$OPENVPN" -e "OPENVPN=$OPENVPN" \
@@ -446,6 +377,10 @@ rollback_created_user() {
 	atomic_without_user "$CLIENT_DB" "$CLIENT_NAME" csv
 	atomic_without_user "$CLIENT_HISTORY" "$CLIENT_NAME" csv
 	remove_password_user "$CLIENT_NAME"
+	if container_running; then
+		docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
+			"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd" >/dev/null 2>&1 || true
+	fi
 	set_runtime_ownership
 	log_info "用户创建回滚完成: $CLIENT_NAME"
 	handle_error "$exit_code" "$line_number"
@@ -513,7 +448,6 @@ remove_password_user() {
 delete_user() {
 	normalize_user "$USER_INPUT"
 	[[ -f $CLIENT_CERT ]] || fail "用户不存在: $CLIENT_NAME"
-	client_ip=$(awk -F', ' -v user="$CLIENT_NAME" '$1 == user { print $2; exit }' "$CLIENT_DB")
 	log_start "删除 VPN 用户: ${CLIENT_NAME}（环境: ${ENV_NAME}）"
 	log_info "吊销证书并清理客户端配置、CCD 和认证数据"
 
@@ -525,12 +459,9 @@ delete_user() {
 	remove_password_user "$CLIENT_NAME"
 
 	if container_running; then
-		log_info "删除运行中的 iptables/ipset 访问规则"
-		[[ -z $client_ip ]] || docker exec "$CONTAINER_NAME" iptables -D FORWARD -s "$client_ip" \
-			-m set --match-set "$IPSET_NAME" dst -m comment --comment "allow $CLIENT_NAME route group" \
-			-j ACCEPT 2>/dev/null || true
-		docker exec "$CONTAINER_NAME" ipset destroy "$IPSET_NAME" 2>/dev/null || true
-		save_rules
+		log_info "根据当前用户状态重建访问规则"
+		docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
+			"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd"
 	else
 		log_info "容器未运行，跳过运行时访问规则清理"
 	fi
@@ -656,7 +587,7 @@ normalize_route() {
 	ROUTE_LINE="push \"route $ROUTE_IP $ROUTE_MASK\""
 }
 
-# 为指定用户添加 CCD 路由和运行时 ipset 规则。
+# 为指定用户添加 CCD 路由。
 add_route_for_user() {
 	local user=$1
 	normalize_user "$user"
@@ -667,41 +598,60 @@ add_route_for_user() {
 	else
 		log_info "CCD 中已存在该路由，跳过重复写入"
 	fi
-	require_running
-	docker exec "$CONTAINER_NAME" ipset add "$IPSET_NAME" "$ROUTE_CIDR" -exist
-	save_rules
-	log_success "路由添加完成: $CLIENT_NAME -> $ROUTE_CIDR"
 }
 
-# 删除指定用户的 CCD 路由和运行时 ipset 规则。
+# 删除指定用户的 CCD 路由。
 delete_route_for_user() {
 	local user=$1 temp
 	normalize_user "$user"
 	[[ -f $CLIENT_CCD ]] || fail "找不到用户 CCD: $CLIENT_NAME"
 	log_info "删除用户 $CLIENT_NAME 的路由: $ROUTE_CIDR"
 	if ! grep -Fxq "$ROUTE_LINE" "$CLIENT_CCD"; then
-		log_info "CCD 中不存在该路由，将继续清理可能残留的 ipset 规则"
+		log_info "CCD 中不存在该路由"
 	fi
 	temp=$(mktemp "${CLIENT_CCD}.XXXXXX")
 	grep -Fvx "$ROUTE_LINE" "$CLIENT_CCD" >"$temp" || true
 	mv "$temp" "$CLIENT_CCD"
 	chmod 600 "$CLIENT_CCD"
 	chown 65534:65534 "$CLIENT_CCD" 2>/dev/null || true
+}
+
+# 修改单个用户 CCD，并增量更新对应 ipset。
+apply_route() {
+	local action=$1 action_name backup
 	require_running
-	docker exec "$CONTAINER_NAME" ipset del "$IPSET_NAME" "$ROUTE_CIDR" 2>/dev/null || true
-	save_rules
-	log_success "路由删除完成: $CLIENT_NAME -> $ROUTE_CIDR"
+	normalize_user "$USER_INPUT"
+	[[ -f $CLIENT_CCD ]] || fail "找不到用户 CCD: $CLIENT_NAME"
+	backup=$(mktemp "${CLIENT_CCD}.XXXXXX")
+	cp -p "$CLIENT_CCD" "$backup"
+	if [[ $action == add ]]; then
+		action_name=添加
+		add_route_for_user "$USER_INPUT"
+	else
+		action_name=删除
+		delete_route_for_user "$USER_INPUT"
+	fi
+	if ! docker exec "$CONTAINER_NAME" ovpn_firewall update-routes \
+		"$action" "$CLIENT_NAME" "$ROUTE_CIDR"; then
+		mv "$backup" "$CLIENT_CCD"
+		docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
+			"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd" >/dev/null 2>&1 || true
+		fail "运行时路由更新失败，CCD 已回滚: $CLIENT_NAME -> $ROUTE_CIDR"
+	fi
+	rm -f "$backup"
+	log_success "路由${action_name}完成: $CLIENT_NAME -> $ROUTE_CIDR"
 }
 
 # 解析域名文件或逗号分隔参数，经确认后为单个或全部用户批量添加 IPv4 路由。
 add_domain_routes() {
 	local scope=${1:-user} domain_source confirm_option domain_input source_description
 	local scope_description summary_label completion_prefix partial_prefix
-	local raw_line domain resolved_output ip route_line existing answer index target target_ccd
+	local raw_line domain resolved_output ip route_line existing answer index target target_ccd backup_dir
 	local resolved_count=0 pending_count=0 duplicate_count=0 failed_count=0 success_count=0
 	local -a target_users=() resolved_domains=() resolved_route_ips=()
 	local -a pending_users=() pending_domains=() pending_ips=()
 	local -a duplicate_users=() duplicate_domains=() duplicate_ips=()
+	local -a route_updates=()
 
 	case $scope in
 	user)
@@ -856,11 +806,26 @@ add_domain_routes() {
 		esac
 	fi
 
+	backup_dir=$(mktemp -d "$LOCAL_PATH/state/ccd-routes.XXXXXX")
+	for target in "${target_users[@]}"; do
+		cp -p "$CCD_DIR/$target" "$backup_dir/$target"
+	done
 	for index in "${!pending_ips[@]}"; do
 		normalize_route "${pending_ips[$index]}"
 		add_route_for_user "${pending_users[$index]}"
+		route_updates+=("${pending_users[$index]}" "${pending_ips[$index]}/32")
 		success_count=$((success_count + 1))
 	done
+	if ! docker exec "$CONTAINER_NAME" ovpn_firewall update-routes add "${route_updates[@]}"; then
+		for target in "${target_users[@]}"; do
+			cp -p "$backup_dir/$target" "$CCD_DIR/$target"
+		done
+		rm -r "$backup_dir"
+		docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
+			"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd" >/dev/null 2>&1 || true
+		fail "运行时域名路由更新失败，CCD 已回滚"
+	fi
+	rm -r "$backup_dir"
 	if ((failed_count > 0)); then
 		fail "$partial_prefix，成功 $success_count 个，失败 $failed_count 个"
 	fi
@@ -882,20 +847,40 @@ list_routes() {
 
 # 为当前环境全部 CCD 用户批量添加或删除指定路由。
 route_all() {
-	local action=$1 ccd user count=0 action_name
+	local action=$1 ccd user count=0 action_name backup_dir
+	local -a users=() route_updates=()
 	normalize_route "$USER_INPUT"
+	require_running
 	if [[ $action == add ]]; then action_name=添加; else action_name=删除; fi
 	log_start "为环境 $ENV_NAME 的全部用户${action_name}路由: $ROUTE_CIDR"
 	for ccd in "$CCD_DIR"/*; do
 		[[ -f $ccd ]] || continue
 		user=$(basename "$ccd")
+		users+=("$user")
+	done
+	((${#users[@]} > 0)) || fail "环境 $ENV_NAME 中没有 CCD 用户"
+	backup_dir=$(mktemp -d "$LOCAL_PATH/state/ccd-routes.XXXXXX")
+	for user in "${users[@]}"; do
+		cp -p "$CCD_DIR/$user" "$backup_dir/$user"
 		count=$((count + 1))
 		if [[ $action == add ]]; then
 			add_route_for_user "$user"
 		else
 			delete_route_for_user "$user"
 		fi
+		route_updates+=("$user" "$ROUTE_CIDR")
 	done
+	if ! docker exec "$CONTAINER_NAME" ovpn_firewall update-routes \
+		"$action" "${route_updates[@]}"; then
+		for user in "${users[@]}"; do
+			cp -p "$backup_dir/$user" "$CCD_DIR/$user"
+		done
+		rm -r "$backup_dir"
+		docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
+			"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd" >/dev/null 2>&1 || true
+		fail "运行时批量路由更新失败，CCD 已回滚"
+	fi
+	rm -r "$backup_dir"
 	log_success "批量路由操作完成: ${action_name} ${ROUTE_CIDR}，共处理 $count 个用户"
 }
 
@@ -933,24 +918,13 @@ delete_hardware() {
 	list_hardware
 }
 
-# 从运行目录备份恢复容器内的 iptables 规则。
-reload_iptables() {
+# 根据当前配置、用户状态和 CCD 重建容器防火墙规则。
+sync_rules() {
 	require_running
-	[[ -r $IPTABLES_BACKUP ]] || fail "找不到可读的 iptables 规则备份: $IPTABLES_BACKUP"
-	log_start "恢复 iptables 规则: $CONTAINER_NAME"
-	log_info "规则备份: $IPTABLES_BACKUP"
-	docker exec "$CONTAINER_NAME" sh -c 'iptables-restore < "$1/state/iptables.rules"' sh "$OPENVPN"
-	log_success "iptables 规则恢复完成"
-}
-
-# 从运行目录备份恢复容器内的 ipset 规则。
-reload_ipset() {
-	require_running
-	[[ -r $IPSET_BACKUP ]] || fail "找不到可读的 ipset 规则备份: $IPSET_BACKUP"
-	log_start "恢复 ipset 规则: $CONTAINER_NAME"
-	log_info "规则备份: $IPSET_BACKUP"
-	docker exec "$CONTAINER_NAME" sh -c 'ipset restore -exist < "$1/state/ipset.rules"' sh "$OPENVPN"
-	log_success "ipset 规则恢复完成"
+	log_start "重建防火墙规则: $CONTAINER_NAME"
+	docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
+		"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd"
+	log_success "防火墙规则重建完成"
 }
 
 # 调用维护脚本备份宿主机网络策略。
@@ -1048,12 +1022,12 @@ listroute | -lr)
 addroute | -ar)
 	load_env
 	normalize_route "$ARGUMENT"
-	add_route_for_user "$USER_INPUT"
+	apply_route add
 	;;
 delroute | -dr)
 	load_env
 	normalize_route "$ARGUMENT"
-	delete_route_for_user "$USER_INPUT"
+	apply_route delete
 	;;
 adddomainroute | -adr)
 	load_env
@@ -1095,13 +1069,9 @@ status)
 	load_env
 	show_status
 	;;
-reloadiptables)
+syncrules)
 	load_env
-	reload_iptables
-	;;
-reloadipset)
-	load_env
-	reload_ipset
+	sync_rules
 	;;
 backuphostnetwork)
 	load_env

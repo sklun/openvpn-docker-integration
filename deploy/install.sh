@@ -96,11 +96,20 @@ validate_config() {
 	[[ ${OVPN_PORT:-} =~ ^[0-9]+$ ]] || fail "OVPN_PORT must be numeric"
 	((OVPN_PORT >= 1 && OVPN_PORT <= 65535)) || fail "OVPN_PORT is out of range"
 	validate_cidr "${OVPN_CLIENT_SUBNET:-}" 29 || fail "invalid OVPN_CLIENT_SUBNET: ${OVPN_CLIENT_SUBNET:-}"
-	validate_cidr "${OVPN_VPC_SUBNET:-}" 32 || fail "invalid OVPN_VPC_SUBNET: ${OVPN_VPC_SUBNET:-}"
+	case ${OVPN_NAT:-false} in
+	true | false) ;;
+	*) fail "OVPN_NAT must be true or false" ;;
+	esac
+	[[ ${OVPN_NATDEVICE:-eth0} =~ ^[a-zA-Z0-9_.:+-]{1,15}$ ]] ||
+		fail "invalid OVPN_NATDEVICE: ${OVPN_NATDEVICE:-}"
 	case ${OVPN_PROTO:-udp} in
 	udp | udp6) OVPN_PORT_PROTO=udp ;;
 	tcp | tcp6) OVPN_PORT_PROTO=tcp ;;
 	*) fail "OVPN_PROTO must be udp, udp6, tcp or tcp6" ;;
+	esac
+	case ${OVPN_IPTABLES_BACKEND:-auto} in
+	auto | nft | legacy) ;;
+	*) fail "OVPN_IPTABLES_BACKEND must be auto, nft or legacy" ;;
 	esac
 	client_prefix=${OVPN_CLIENT_SUBNET#*/}
 	((10#$client_prefix >= 1)) || fail "OVPN_CLIENT_SUBNET prefix must be between 1 and 29"
@@ -117,7 +126,7 @@ validate_config() {
 		[[ -n ${LDAP_BASE_DN:-} ]] || fail "LDAP_BASE_DN is required when LDAP=true"
 	fi
 	if [[ -n ${OVPN_USER_SUFFIX:-} ]]; then
-		[[ $OVPN_USER_SUFFIX =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || \
+		[[ $OVPN_USER_SUFFIX =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] ||
 			fail "OVPN_USER_SUFFIX contains unsupported characters"
 	fi
 }
@@ -129,13 +138,13 @@ Runtime path:    $OVPN_LOCAL_PATH
 Image:           $OVPN_IMAGE
 Endpoint:        $OVPN_HOST:$OVPN_PORT/$OVPN_PROTO
 Client subnet:   $OVPN_CLIENT_SUBNET
-VPC subnet:      $OVPN_VPC_SUBNET
 OTP:             ${OTP:-false}
 Password auth:   ${PASSWORD_AUTH:-false}
 LDAP:            ${LDAP:-false}
 User suffix:     ${OVPN_USER_SUFFIX:-$SERVER_ENV}
 Device binding:  ${DEVICE_AUTH:-false}
 Auto revoke:     ${AUTO_REVOKE:-false}
+iptables backend: ${OVPN_IPTABLES_BACKEND:-auto}
 EOF
 	if [[ -t 0 ]]; then
 		local answer
