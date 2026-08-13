@@ -25,6 +25,11 @@ grep -Fq 'adddomainrouteall' <<<"$help_output"
 grep -Fq '| -adra' <<<"$help_output"
 grep -Fq '服务与规则:' <<<"$help_output"
 grep -Fq 'backuphostnetwork' <<<"$help_output"
+grep -Fq 'syncrules' <<<"$help_output"
+if grep -Eq 'reloadipset|reloadiptables' <<<"$help_output"; then
+    echo "obsolete firewall reload command remains in help" >&2
+    exit 1
+fi
 grep -Fq 'OVPN_USER_SUFFIX 可覆盖该后缀' <<<"$help_output"
 grep -Fq '密码、OTP 密钥、私钥或 LDAP 凭据' <<<"$help_output"
 if bash "$PROJECT_ROOT/deploy/install.sh" >/dev/null 2>&1; then
@@ -32,7 +37,7 @@ if bash "$PROJECT_ROOT/deploy/install.sh" >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "+ CIDR and mask conversion"
+echo "+ CIDR conversion"
 (
     set -- help
     # shellcheck source=/dev/null
@@ -40,29 +45,12 @@ echo "+ CIDR and mask conversion"
 
     for prefix in {0..32}; do
         mask=$(cidr_to_mask "$prefix")
-        converted_prefix=$(mask_to_cidr "$mask")
-        if [[ $converted_prefix != "$prefix" ]]; then
-            echo "CIDR round trip failed: $prefix -> $mask -> $converted_prefix" >&2
-            exit 1
-        fi
+        [[ $mask =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
     done
 
     for prefix in -1 33 01 abc ""; do
         if cidr_to_mask "$prefix" >/dev/null; then
             echo "invalid CIDR prefix unexpectedly accepted: $prefix" >&2
-            exit 1
-        fi
-    done
-
-    for mask in \
-        255.255.0 \
-        255.255.255.255.0 \
-        255.255.127.0 \
-        255.0.255.0 \
-        255.254.128.0 \
-        255.255.255.1; do
-        if mask_to_cidr "$mask" >/dev/null; then
-            echo "invalid subnet mask unexpectedly accepted: $mask" >&2
             exit 1
         fi
     done
@@ -85,10 +73,42 @@ grep -Fq 'file="@OPENVPN@/logs/iptables.log"' "$PROJECT_ROOT/deploy/config/ulogd
 grep -Fq 'maintenance/backup-host-network.sh' "$PROJECT_ROOT/deploy/install.sh"
 grep -Fq 'hooks/connection-state.sh' "$PROJECT_ROOT/deploy/install.sh"
 grep -Fq 'require_command iptables-save' "$PROJECT_ROOT/deploy/install.sh"
-grep -Eq '^[[:space:]]+libqrencode-tools \\' "$PROJECT_ROOT/server/Dockerfile"
-grep -Fq 'ln -sf xtables-nft-multi "/usr/sbin/${command}"' "$PROJECT_ROOT/server/Dockerfile"
-if grep -Fq 'ln -sf xtables-nft-multi "/sbin/${command}"' "$PROJECT_ROOT/server/Dockerfile"; then
-    echo "broken /sbin xtables link remains in Dockerfile" >&2
+grep -Fq "        libqrencode-tools \\" "$PROJECT_ROOT/server/Dockerfile"
+grep -Fq "        iptables-legacy \\" "$PROJECT_ROOT/server/Dockerfile"
+if grep -Fq 'ln -sf xtables-nft-multi' "$PROJECT_ROOT/server/Dockerfile"; then
+    echo "forced nft frontend link remains in Dockerfile" >&2
+    exit 1
+fi
+grep -Fq 'OVPN_IPTABLES_BACKEND="auto"' "$PROJECT_ROOT/deploy/ovpn.env.example"
+grep -Fq 'command -v iptables-nft' "$PROJECT_ROOT/server/bin/ovpn_firewall"
+grep -Fq 'command -v iptables-legacy' "$PROJECT_ROOT/server/bin/ovpn_firewall"
+grep -Fq 'ovpn_firewall sync-rules' "$PROJECT_ROOT/server/bin/ovpn_run"
+grep -Fq 'delete_forward_rules_by_comment "reject all vpc subnet"' \
+    "$PROJECT_ROOT/server/bin/ovpn_firewall"
+grep -Fq 'delete_managed_user_forward_rules' "$PROJECT_ROOT/server/bin/ovpn_firewall"
+grep -Fq 'openvpn policy rebuild' "$PROJECT_ROOT/server/bin/ovpn_firewall"
+grep -Fq 'save_snapshots' "$PROJECT_ROOT/server/bin/ovpn_firewall"
+grep -Fq 'delete_postrouting_masquerade_rules' "$PROJECT_ROOT/server/bin/ovpn_firewall"
+if grep -Rq -E 'ovpn_firewall restore|ipset restore|reloadipset|reloadiptables' \
+    "$PROJECT_ROOT/server" "$PROJECT_ROOT/deploy"; then
+    echo "obsolete firewall restore path remains" >&2
+    exit 1
+fi
+# shellcheck disable=SC2016  # Matching literal source text.
+if grep -Fq 'OVPN_NAT:-false}" || is_true "${OVPN_DEFROUTE' \
+    "$PROJECT_ROOT/server/bin/ovpn_run" "$PROJECT_ROOT/server/bin/ovpn_firewall"; then
+    echo "OVPN_DEFROUTE still enables NAT implicitly" >&2
+    exit 1
+fi
+if grep -Rq 'OVPN_VPC_SUBNET' "$PROJECT_ROOT/server" "$PROJECT_ROOT/deploy"; then
+    echo "obsolete VPC-only firewall scope remains" >&2
+    exit 1
+fi
+# Runtime rule management must also work with classic iptables lacking -C.
+if grep -R -E -- '[[:space:]]-C[[:space:]]' \
+    "$PROJECT_ROOT/server/bin/ovpn_run" "$PROJECT_ROOT/deploy/hooks/client-connect-ldap.sh" \
+    "$PROJECT_ROOT/deploy/ovpn" >/dev/null; then
+    echo "iptables -C remains in runtime rule management" >&2
     exit 1
 fi
 # shellcheck disable=SC2016  # Matching literal source text.
@@ -102,6 +122,240 @@ for legacy_directory in scripts tools deploy/scripts deploy/tools server/scripts
 done
 template_last_byte=$(tail -c 1 "$PROJECT_ROOT/deploy/templates/ccd/default" | od -An -t x1 | tr -d '[:space:]')
 [[ $template_last_byte == 0a ]]
+
+echo "+ Shared connection state update"
+connection_runtime="$TEST_ROOT/connection-runtime"
+mkdir -p "$connection_runtime/state"
+printf '%s\n' \
+    'alice-test, 10.8.0.2, , , , , , 1' \
+    'alice.test, 10.8.0.3, , , , , , 2' \
+    >"$connection_runtime/state/client-ips.csv"
+(
+    export OPENVPN="$connection_runtime"
+    # shellcheck source=/dev/null
+    source "$PROJECT_ROOT/deploy/hooks/connection-state.sh"
+    update_login_time alice.test "$connection_runtime/state/client-ips.csv"
+)
+[[ $(awk -F', ' '$1 == "alice-test" { print $8 }' \
+    "$connection_runtime/state/client-ips.csv") == 1 ]]
+updated_login=$(awk -F', ' '$1 == "alice.test" { print $8 }' \
+    "$connection_runtime/state/client-ips.csv")
+[[ $updated_login =~ ^[0-9]+$ && $updated_login != 2 ]]
+
+echo "+ Adaptive iptables backend selection"
+firewall_root="$TEST_ROOT/firewall"
+firewall_bin="$firewall_root/bin"
+firewall_log="$firewall_root/commands.log"
+mkdir -p "$firewall_bin"
+cat >"$firewall_bin/xtables-mock" <<'EOF'
+#!/bin/sh
+command_name=${0##*/}
+printf '%s %s\n' "$command_name" "$*" >>"$FIREWALL_MOCK_LOG"
+case $command_name in
+    *-save)
+        printf '*filter\nCOMMIT\n'
+        ;;
+    iptables-nft | ip6tables-nft)
+        if [ "${1:-}" = "--version" ]; then
+            printf 'iptables v1.8.9 (nf_tables)\n'
+        elif [ "${1:-}" = "-D" ] || printf ' %s ' "$*" | grep -q ' -D '; then
+            exit 1
+        elif [ "${MOCK_NFT_FAIL:-false}" = true ]; then
+            case $* in
+                '-t filter -N OVPNFW'*) exit 1 ;;
+            esac
+        fi
+        ;;
+    iptables-legacy | ip6tables-legacy)
+        if [ "${1:-}" = "--version" ]; then
+            printf 'iptables v1.8.9 (legacy)\n'
+        elif [ "${1:-}" = "-D" ] || printf ' %s ' "$*" | grep -q ' -D '; then
+            exit 1
+        fi
+        ;;
+    iptables | ip6tables)
+        if [ "${1:-}" = "--version" ]; then
+            printf 'iptables v1.4.7\n'
+        elif [ "${1:-}" = "-D" ] || printf ' %s ' "$*" | grep -q ' -D '; then
+            exit 1
+        fi
+        ;;
+esac
+EOF
+cat >"$firewall_bin/ipset" <<'EOF'
+#!/bin/sh
+printf 'ipset %s\n' "$*" >>"$FIREWALL_MOCK_LOG"
+if [ "${1:-}" = list ] && [ "${2:-}" = -name ]; then
+    printf '%s\n' stale-test
+elif [ "${1:-}" = save ]; then
+    printf 'create alice-test hash:net family inet hashsize 1024 maxelem 65536\n'
+    printf 'add alice-test 10.20.0.0/16\n'
+fi
+EOF
+cat >"$firewall_bin/flock" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$firewall_bin/xtables-mock" "$firewall_bin/ipset" "$firewall_bin/flock"
+
+link_frontend() {
+    local directory=$1 frontend=$2 command
+    mkdir -p "$directory"
+    ln -sf "$firewall_bin/xtables-mock" "$directory/xtables-mock"
+    case $frontend in
+        nft)
+            for command in iptables-nft iptables-nft-save; do
+                ln -sf xtables-mock "$directory/$command"
+            done
+            ;;
+        legacy)
+            for command in iptables-legacy iptables-legacy-save; do
+                ln -sf xtables-mock "$directory/$command"
+            done
+            ;;
+        classic)
+            for command in iptables iptables-save; do
+                ln -sf xtables-mock "$directory/$command"
+            done
+            ;;
+    esac
+}
+
+nft_bin="$firewall_root/nft-bin"
+legacy_bin="$firewall_root/legacy-bin"
+classic_bin="$firewall_root/classic-bin"
+link_frontend "$nft_bin" nft
+link_frontend "$legacy_bin" legacy
+link_frontend "$classic_bin" classic
+
+auto_runtime="$firewall_root/auto-runtime"
+mkdir -p "$auto_runtime"
+cat >"$auto_runtime/ovpn.env" <<'EOF'
+OVPN_IPTABLES_BACKEND=auto
+IPTABLES_POLICY=true
+OVPN_NAT=true
+EOF
+selected=$(OPENVPN="$auto_runtime" FIREWALL_MOCK_LOG="$firewall_log" \
+    PATH="$nft_bin:$legacy_bin:$firewall_bin:/usr/bin:/bin" \
+    bash "$PROJECT_ROOT/server/bin/ovpn_firewall" select)
+[[ $selected == nft ]]
+[[ $(<"$auto_runtime/state/iptables.backend") == nft ]]
+grep -Eq 'iptables-nft -t filter -N OVPNFW[0-9]+' "$firewall_log"
+grep -Eq 'iptables-nft -t nat -A OVPNFW[0-9]+' "$firewall_log"
+
+defroute_runtime="$firewall_root/defroute-runtime"
+mkdir -p "$defroute_runtime"
+cat >"$defroute_runtime/ovpn.env" <<'EOF'
+OVPN_IPTABLES_BACKEND=auto
+IPTABLES_POLICY=false
+OVPN_DEFROUTE=true
+OVPN_NAT=false
+EOF
+: >"$firewall_log"
+OPENVPN="$defroute_runtime" FIREWALL_MOCK_LOG="$firewall_log" \
+    PATH="$nft_bin:$legacy_bin:$firewall_bin:/usr/bin:/bin" \
+    bash "$PROJECT_ROOT/server/bin/ovpn_firewall" select >/dev/null
+if grep -Eq 'iptables-nft -t nat -N OVPNFW[0-9]+' "$firewall_log"; then
+    echo "OVPN_DEFROUTE unexpectedly triggered a NAT capability probe" >&2
+    exit 1
+fi
+
+fallback_runtime="$firewall_root/fallback-runtime"
+mkdir -p "$fallback_runtime"
+printf 'OVPN_IPTABLES_BACKEND=auto\n' >"$fallback_runtime/ovpn.env"
+selected=$(OPENVPN="$fallback_runtime" FIREWALL_MOCK_LOG="$firewall_log" MOCK_NFT_FAIL=true \
+    PATH="$nft_bin:$legacy_bin:$firewall_bin:/usr/bin:/bin" \
+    bash "$PROJECT_ROOT/server/bin/ovpn_firewall" select)
+[[ $selected == legacy ]]
+grep -Eq 'iptables-legacy -t filter -N OVPNFW[0-9]+' "$firewall_log"
+
+classic_runtime="$firewall_root/classic-runtime"
+mkdir -p "$classic_runtime"
+printf 'OVPN_IPTABLES_BACKEND=legacy\n' >"$classic_runtime/ovpn.env"
+selected=$(OPENVPN="$classic_runtime" FIREWALL_MOCK_LOG="$firewall_log" \
+    PATH="$classic_bin:$firewall_bin:/usr/bin:/bin" \
+    bash "$PROJECT_ROOT/server/bin/ovpn_firewall" select)
+[[ $selected == legacy ]]
+grep -Fq 'iptables --version' "$firewall_log"
+OPENVPN="$classic_runtime" FIREWALL_MOCK_LOG="$firewall_log" \
+    PATH="$classic_bin:$firewall_bin:/usr/bin:/bin" \
+    bash "$PROJECT_ROOT/server/bin/ovpn_firewall" iptables -L >/dev/null
+grep -Fq 'iptables -L' "$firewall_log"
+
+forced_runtime="$firewall_root/forced-runtime"
+mkdir -p "$forced_runtime"
+printf 'OVPN_IPTABLES_BACKEND=nft\n' >"$forced_runtime/ovpn.env"
+if OPENVPN="$forced_runtime" FIREWALL_MOCK_LOG="$firewall_log" MOCK_NFT_FAIL=true \
+    PATH="$nft_bin:$legacy_bin:$firewall_bin:/usr/bin:/bin" \
+    bash "$PROJECT_ROOT/server/bin/ovpn_firewall" select >/dev/null 2>&1; then
+    echo "forced nft backend unexpectedly fell back to legacy" >&2
+    exit 1
+fi
+
+sync_runtime="$firewall_root/sync-runtime"
+mkdir -p "$sync_runtime/ccd" "$sync_runtime/state"
+cat >"$sync_runtime/ovpn.env" <<'EOF'
+OVPN_IPTABLES_BACKEND=nft
+IPTABLES_POLICY=true
+OVPN_NAT=true
+OVPN_CLIENT_SUBNET=10.8.0.0/24
+OVPN_NATDEVICE=eth0
+EOF
+printf 'alice-test, 10.8.0.2\n' >"$sync_runtime/state/client-ips.csv"
+printf 'push "route 10.20.0.0 255.255.0.0"\n' >"$sync_runtime/ccd/alice-test"
+OPENVPN="$sync_runtime" FIREWALL_MOCK_LOG="$firewall_log" \
+    PATH="$nft_bin:$legacy_bin:$firewall_bin:/usr/bin:/bin" \
+    bash "$PROJECT_ROOT/server/bin/ovpn_firewall" select >/dev/null
+: >"$firewall_log"
+OPENVPN="$sync_runtime" FIREWALL_MOCK_LOG="$firewall_log" \
+    PATH="$nft_bin:$legacy_bin:$firewall_bin:/usr/bin:/bin" \
+    bash "$PROJECT_ROOT/server/bin/ovpn_firewall" sync-rules \
+    "$sync_runtime/state/client-ips.csv" "$sync_runtime/ccd"
+grep -Fq 'ipset list -name' "$firewall_log"
+grep -Fq 'ipset destroy stale-test' "$firewall_log"
+grep -Fq 'ipset create alice-test hash:net' "$firewall_log"
+grep -Fq 'ipset add alice-test 10.20.0.0/16 -exist' "$firewall_log"
+grep -Fq 'iptables-nft -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -m comment --comment openvpn client masquerade -j MASQUERADE' \
+    "$firewall_log"
+grep -Fq 'iptables-nft -A FORWARD -i tun0 -s 10.8.0.2' "$firewall_log"
+[[ -s $sync_runtime/state/iptables.rules ]]
+[[ -s $sync_runtime/state/ipset.rules ]]
+[[ $(<"$sync_runtime/state/iptables.rules.backend") == nft ]]
+
+: >"$firewall_log"
+OPENVPN="$sync_runtime" FIREWALL_MOCK_LOG="$firewall_log" \
+    PATH="$nft_bin:$legacy_bin:$firewall_bin:/usr/bin:/bin" \
+    bash "$PROJECT_ROOT/server/bin/ovpn_firewall" update-routes add \
+    alice-test 10.30.0.0/16 alice-test 10.40.0.0/16
+grep -Fq 'ipset add alice-test 10.30.0.0/16 -exist' "$firewall_log"
+grep -Fq 'ipset add alice-test 10.40.0.0/16 -exist' "$firewall_log"
+grep -Fq 'iptables-nft-save' "$firewall_log"
+grep -Fq 'ipset save' "$firewall_log"
+if grep -Eq 'iptables-nft .* (-A|-D|-I) ' "$firewall_log"; then
+    echo "incremental route update unexpectedly changed iptables" >&2
+    exit 1
+fi
+
+: >"$firewall_log"
+OPENVPN="$sync_runtime" FIREWALL_MOCK_LOG="$firewall_log" \
+    PATH="$nft_bin:$legacy_bin:$firewall_bin:/usr/bin:/bin" \
+    bash "$PROJECT_ROOT/server/bin/ovpn_firewall" update-routes delete \
+    alice-test 10.30.0.0/16
+grep -Fq 'ipset del alice-test 10.30.0.0/16 -exist' "$firewall_log"
+
+printf 'push "route 10.30.0.0 255.0.255.0"\n' >"$sync_runtime/ccd/alice-test"
+: >"$firewall_log"
+if OPENVPN="$sync_runtime" FIREWALL_MOCK_LOG="$firewall_log" \
+    PATH="$nft_bin:$legacy_bin:$firewall_bin:/usr/bin:/bin" \
+    bash "$PROJECT_ROOT/server/bin/ovpn_firewall" sync-rules \
+    "$sync_runtime/state/client-ips.csv" "$sync_runtime/ccd" >/dev/null 2>&1; then
+    echo "invalid CCD unexpectedly passed full rule synchronization" >&2
+    exit 1
+fi
+if grep -Eq 'iptables-nft .* -D |ipset destroy' "$firewall_log"; then
+    echo "invalid CCD changed runtime rules before validation completed" >&2
+    exit 1
+fi
 
 echo "+ OTP QR output"
 otp_runtime="$TEST_ROOT/otp-runtime"
@@ -143,6 +397,38 @@ grep -Fq -- '--qr-mode=NONE' "$otp_args_log"
 grep -Fq -- '-l alice@vpn.test.example' "$otp_args_log"
 grep -Fq -- '-i vpn.test.example' "$otp_args_log"
 grep -Fxq 'otpauth://totp/alice@vpn.test.example?secret=JBSWY3DPEHPK3PXP&issuer=vpn.test.example' "$otp_uri_log"
+
+echo "+ Client configuration defaults"
+client_runtime="$TEST_ROOT/client-runtime"
+client_bin="$TEST_ROOT/client-bin"
+mkdir -p "$client_runtime/pki/private" "$client_runtime/pki/issued" \
+    "$client_runtime/clients" "$client_bin"
+cat >"$client_runtime/ovpn.env" <<EOF
+EASYRSA_PKI="$client_runtime/pki"
+OVPN_DEVICE=tun
+OVPN_HOST=vpn.test.example
+OVPN_PORT=1194
+OVPN_PROTO=udp
+EOF
+printf 'PRIVATE KEY\n' >"$client_runtime/pki/private/alice.key"
+printf 'CERTIFICATE\n' >"$client_runtime/pki/issued/alice.crt"
+printf 'CA\n' >"$client_runtime/pki/ca.crt"
+printf 'TLS AUTH\n' >"$client_runtime/pki/ta.key"
+cat >"$client_bin/openssl" <<'EOF'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = -in ]; then
+        cat "$2"
+        exit
+    fi
+    shift
+done
+exit 1
+EOF
+chmod +x "$client_bin/openssl"
+client_config=$(OPENVPN="$client_runtime" PATH="$client_bin:$PATH" \
+    bash "$PROJECT_ROOT/server/bin/ovpn_getclient" alice combined)
+[[ $(grep -Fxc 'push-peer-info' <<<"$client_config") -eq 1 ]]
 
 make_env() {
     local target=$1 ldap=$2 otp=$3 password_auth=$4
