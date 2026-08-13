@@ -9,8 +9,6 @@ source "$OPENVPN/ovpn.env"
 
 cn=${1:-}
 format=${2:-combined}
-extra_mark=${3:-}
-extra_values=${4:-}
 [[ -n $cn ]] || { echo "Usage: ovpn_getclient <name> [combined|combined-save|separated]" >&2; exit 1; }
 [[ -f $EASYRSA_PKI/private/$cn.key ]] || { echo "Client key not found: $cn" >&2; exit 1; }
 
@@ -26,6 +24,7 @@ nobind
 dev $OVPN_DEVICE
 remote-cert-tls server
 remote $OVPN_HOST $OVPN_PORT $OVPN_PROTO
+push-peer-info
 EOF
     if [[ $OVPN_PROTO == udp6 ]]; then
         echo "remote $OVPN_HOST $OVPN_PORT udp"
@@ -69,11 +68,6 @@ EOF
         echo "auth-user-pass"
         echo "auth-nocache"
         echo "reneg-sec 0"
-    fi
-    is_true "${DEVICE_AUTH:-false}" && echo "push-peer-info"
-
-    if [[ $extra_mark == -e && -n $extra_values ]]; then
-        tr ',' '\n' <<<"$extra_values"
     fi
 }
 

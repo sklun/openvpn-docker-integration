@@ -467,7 +467,7 @@ create_user() {
 	docker run --rm -v "$LOCAL_PATH:$OPENVPN" -e "OPENVPN=$OPENVPN" \
 		"$OVPN_IMAGE" easyrsa --batch build-client-full "$CLIENT_NAME" nopass
 	docker run --rm -v "$LOCAL_PATH:$OPENVPN" -e "OPENVPN=$OPENVPN" \
-		"$OVPN_IMAGE" ovpn_getclient "$CLIENT_NAME" combined-save -e push-peer-info
+		"$OVPN_IMAGE" ovpn_getclient "$CLIENT_NAME" combined-save
 
 	if is_true "${OTP:-false}"; then
 		log_info "生成 OTP 密钥（密钥仅输出到用户文件和当前命令结果）"
@@ -495,7 +495,7 @@ renew_user() {
 		"$OVPN_IMAGE" easyrsa --batch renew "$CLIENT_NAME"
 	log_info "重新生成客户端配置"
 	docker run --rm -v "$LOCAL_PATH:$OPENVPN" -e "OPENVPN=$OPENVPN" \
-		"$OVPN_IMAGE" ovpn_getclient "$CLIENT_NAME" combined-save -e push-peer-info
+		"$OVPN_IMAGE" ovpn_getclient "$CLIENT_NAME" combined-save
 	set_runtime_ownership
 	log_success "用户证书更新完成: $CLIENT_NAME"
 }
