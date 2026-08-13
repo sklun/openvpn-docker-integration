@@ -4,6 +4,8 @@
 OPENVPN=${OPENVPN:-/etc/openvpn}
 # shellcheck source=/dev/null
 source "$OPENVPN/ovpn.env"
+# shellcheck source=/dev/null
+source "$OVPN_HOOKS_PATH/connection-state.sh"
 
 # get variables from environment
 # common_name: user name
@@ -28,13 +30,14 @@ db_path="$OPENVPN/state/client-ips.csv"
 db_hist_path="$OPENVPN/state/client-ip-history.csv"
 
 # create log file daily
-[[ ! -f "${log_path}" ]] && touch "${log_path}"
+mkdir -p "$(dirname "$log_path")"
+touch "$log_path"
 
 # Check whether the user has records in the DB, return user_info
 check_user() {
     # shellcheck disable=SC2154  # Injected by OpenVPN.
     user_cip="${common_name}, ${ifconfig_pool_remote_ip}"
-    user_info=$(grep "$user_cip" "$db_path")
+    user_info=$(awk -F', ' -v user="$common_name" '$1 == user { print; exit }' "$db_path")
     # Exit when the user info cannot be found in the DB.
     # shellcheck disable=SC2154  # Injected by OpenVPN.
     [[ -z $user_info ]] &&
@@ -59,6 +62,7 @@ ${log_date} [DEV_AUTH] ${user_cip} DEVICE UUID/SN:=${IV_INFO}\n\
 ${log_date} [DEV_AUTH] ${user_cip} DISK UUID:=${IV_DISK}" |
             column -s '=' -t
         # win "\" in IV_USER needs to be replaced with "\\"
+        # shellcheck disable=SC2154  # Set by update_login_time in connection-state.sh.
         add_info=$(echo "${user_cip}, ${IV_PLAT}, ${IV_PLAT_VER}, ${IV_USER}, ${IV_INFO}, ${IV_DISK}, ${login_time}" |
             sed 's.\\.\\\\.g')
         sed -i "/^$user_cip/c $add_info" "${db_path}"
@@ -66,30 +70,6 @@ ${log_date} [DEV_AUTH] ${user_cip} DISK UUID:=${IV_DISK}" |
         echo -e "${log_date} [DEV_AUTH] [ACCESS] USER ${user_cip} from $trusted_ip LOGGED IN\n" | tee -a "${log_path}"
         exit 0
     fi
-}
-modify_colmun() {
-    # Usage: modify_colmun "$search_str" "$clumn" "$replace_str" "$file_path" "$separator"
-    local search_str=$1
-    local colmun=$2
-    local replace_str=$3
-    local file_path=$4
-    local separator=$5
-    local file_path_tmp
-    file_path_tmp=${file_path}_$(date +%s)
-    awk -F"$separator" -v search="$search_str" -v colmun="$colmun" -v replace="$replace_str" -v OFS="$separator" '{
-        if ($0 ~ search) {
-            if (NF < colmun) {
-                for (i = NF + 1; i < colmun; i++) {
-                    $i = ""
-                }
-                $colmun = replace
-            } else {
-                $colmun = replace
-            }
-        }
-        print $0
-    }' "$file_path" >"$file_path_tmp"
-    mv "$file_path_tmp" "$file_path"
 }
 # Check Custom Columns
 # Usage: check_items item_var_name item_column_in_db item_describe
@@ -113,34 +93,6 @@ check_items() {
     fi
 }
 
-balck_white_list() {
-    server_env=$(openssl x509 -noout -subject -in "$EASYRSA_PKI/ca.crt" | awk '{print $3}')
-    user_in_white=false
-    user_in_black=false
-    if [[ -n "${white_list[*]}" ]]; then
-        for white_list in "${white_list[@]}"; do
-            if [[ $common_name == "${white_list}-${server_env}" ]]; then
-                user_in_white=true
-                echo -e "\n${log_date} [DEV_AUTH] ${user_cip} Whitelist user, skipping verification\n"
-            fi
-        done
-        if $user_in_white; then
-            exit 0
-        fi
-    fi
-    if [[ -n "${black_list[*]}" ]]; then
-        for black_list in "${black_list[@]}"; do
-            if [[ $common_name == "${black_list}-${server_env}" ]]; then
-                user_in_black=true
-                echo -e "\n${log_date} [DEV_AUTH] ${user_cip} Blacklisted users, enable verification\n"
-            fi
-        done
-        if ! $user_in_black; then
-            exit 0
-        fi
-    fi
-}
-
 echo_login_info() {
     echo
     echo -e "${log_date} [DEV_AUTH] ${user_cip} [LOGIN INFO]\n\
@@ -153,30 +105,6 @@ ${log_date} [DEV_AUTH] ${user_cip} DEVICE UUID/SN:=${IV_INFO}\n\
 ${log_date} [DEV_AUTH] ${user_cip} DISK UUID:=${IV_DISK}" |
         column -s '=' -t
     echo
-}
-update_login_time() {
-    login_time=$(date +%s)
-    try_time=3
-    wait_time=1
-    lock_file="$OPENVPN/state/.client-ip.lock"
-
-    lock_retries=0
-    exec 200>"$lock_file"
-
-    flock -n 200 || {
-        while [ $lock_retries -lt $try_time ]; do
-            sleep $wait_time
-            flock -n 200 && break
-            lock_retries=$((lock_retries + 1))
-        done
-        if [ $lock_retries -eq $try_time ]; then
-            echo "${log_date} [DEV_AUTH] ${user_cip} Unable to update login time"
-            exit 1
-        fi
-
-    }
-    modify_colmun "$user_cip" 8 "$login_time" "$db_path" ', '
-    flock -u 200
 }
 main() {
     # Deny user connection when IV_PLAT is empty
@@ -252,20 +180,7 @@ main() {
 }
 
 
-# Whitelist first
-
-# white list
-# Users in the list will skip verification.
-# When the list is empty, all users will be verified.
-white_list=(
-)
-# black list
-# When there are users in the list, only the users in the list will be verified.
-# Does not take effect when the list is empty
-black_list=(
-)
 # MAIN
 check_user
-update_login_time
-balck_white_list
+update_login_time "$common_name" "$db_path"
 main

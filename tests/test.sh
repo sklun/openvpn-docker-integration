@@ -83,6 +83,7 @@ grep -Fq 'set_env_value "$runtime_env" OVPN_HOOKS_PATH "${OPENVPN}/hooks"' \
 grep -Fq 'file=/etc/openvpn/auth/static-password-users' "$PROJECT_ROOT/server/otp/openvpn"
 grep -Fq 'file="@OPENVPN@/logs/iptables.log"' "$PROJECT_ROOT/deploy/config/ulogd.conf"
 grep -Fq 'maintenance/backup-host-network.sh' "$PROJECT_ROOT/deploy/install.sh"
+grep -Fq 'hooks/connection-state.sh' "$PROJECT_ROOT/deploy/install.sh"
 grep -Fq 'require_command iptables-save' "$PROJECT_ROOT/deploy/install.sh"
 grep -Eq '^[[:space:]]+libqrencode-tools \\' "$PROJECT_ROOT/server/Dockerfile"
 grep -Fq 'ln -sf xtables-nft-multi "/usr/sbin/${command}"' "$PROJECT_ROOT/server/Dockerfile"
@@ -506,6 +507,7 @@ cp -R "$PROJECT_ROOT/deploy" "$TEST_ROOT/deploy-package"
 bash "$TEST_ROOT/deploy-package/package.sh" audit.tar.gz '' >/dev/null
 package_entries=$(tar -tzf "$TEST_ROOT/deploy-package/audit.tar.gz")
 grep -Fq './hooks/client-connect-basic.sh' <<<"$package_entries"
+grep -Fq './hooks/connection-state.sh' <<<"$package_entries"
 grep -Fq './maintenance/rotate-logs.sh' <<<"$package_entries"
 grep -Fq './maintenance/backup-host-network.sh' <<<"$package_entries"
 grep -Fq './templates/ccd/default' <<<"$package_entries"

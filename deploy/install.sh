@@ -167,6 +167,7 @@ prepare_runtime() {
 	fi
 
 	cp "$connect_source" "$OVPN_LOCAL_PATH/hooks/client-connect.sh"
+	cp "$SCRIPT_DIR/hooks/connection-state.sh" "$OVPN_LOCAL_PATH/hooks/connection-state.sh"
 	cp "$SCRIPT_DIR/hooks/client-disconnect.sh" "$OVPN_LOCAL_PATH/hooks/client-disconnect.sh"
 	cp "$SCRIPT_DIR/hooks/ldap-authorize.sh" "$OVPN_LOCAL_PATH/hooks/ldap-authorize.sh"
 	cp "$SCRIPT_DIR/maintenance/backup-host-network.sh" "$OVPN_LOCAL_PATH/maintenance/"
