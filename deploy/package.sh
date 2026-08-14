@@ -9,16 +9,26 @@ IMAGE=${2:-}
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
+if [[ -d $SCRIPT_DIR/../docs ]]; then
+	DOCS_DIR=$(cd "$SCRIPT_DIR/../docs" && pwd)
+elif [[ -d $SCRIPT_DIR/docs ]]; then
+	DOCS_DIR=$(cd "$SCRIPT_DIR/docs" && pwd)
+else
+	echo "Error: project documentation directory not found" >&2
+	exit 1
+fi
+
 mkdir -p "$TEMP_DIR"
 cp "$SCRIPT_DIR/ovpn.env.example" "$TEMP_DIR/"
 cp "$SCRIPT_DIR/ovpn" "$TEMP_DIR/"
 cp "$SCRIPT_DIR/install.sh" "$TEMP_DIR/"
 cp -R "$SCRIPT_DIR/config" "$SCRIPT_DIR/helpers" "$SCRIPT_DIR/hooks" \
-    "$SCRIPT_DIR/maintenance" "$SCRIPT_DIR/templates" "$TEMP_DIR/"
+	"$SCRIPT_DIR/maintenance" "$SCRIPT_DIR/templates" "$TEMP_DIR/"
+cp -R "$DOCS_DIR" "$TEMP_DIR/docs"
 
 if [[ -n $IMAGE ]]; then
-    docker image inspect "$IMAGE" >/dev/null
-    docker save -o "$TEMP_DIR/vpnserverimage.tar" "$IMAGE"
+	docker image inspect "$IMAGE" >/dev/null
+	docker save -o "$TEMP_DIR/vpnserverimage.tar" "$IMAGE"
 fi
 
 tar -C "$TEMP_DIR" -czf "$SCRIPT_DIR/$OUTPUT" .
