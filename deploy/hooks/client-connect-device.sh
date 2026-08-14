@@ -7,6 +7,15 @@ source "$OPENVPN/ovpn.env"
 # shellcheck source=/dev/null
 source "$OVPN_HOOKS_PATH/connection-state.sh"
 
+# 以下变量由 OpenVPN 或客户端注入。
+# common_name: 用户名
+# ifconfig_pool_remote_ip: VPN 客户端 IP
+# trusted_ip: 客户端公网 IP
+# IV_PLAT / IV_PLAT_VER: 平台及版本
+# IV_GUI_VER: 客户端版本和签名信息
+# IV_INFO / IV_CPU / IV_USER / IV_DISK: 设备标识、CPU、系统用户和磁盘 UUID
+# UV_UUID / IV_HWADDR: 移动端设备 UUID 和硬件地址
+
 day=$(date +%F)
 log_date=$(date '+%F %H:%M:%S')
 
