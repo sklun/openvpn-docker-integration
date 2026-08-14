@@ -2,13 +2,13 @@
 # 功能说明：根据客户端配置生成并启用对应的 systemd OpenVPN 客户端服务。
 
 if [[ -z $1 ]]; then
-    echo "Usage: $0 <openvpn_config_path> (Must be an absolute path)"
-    exit 1
+	echo "Usage: $0 <openvpn_config_path> (Must be an absolute path)"
+	exit 1
 fi
 
 if [[ ! -f $1 ]]; then
-    echo "Config file $1 not found"
-    exit 1
+	echo "Config file $1 not found"
+	exit 1
 fi
 
 config_path=$(dirname "$1")
@@ -36,4 +36,4 @@ EOF
 echo "Start Service: $sys_file_name"
 systemctl daemon-reload
 systemctl start "$sys_file_name" &&
-    systemctl enable "$sys_file_name"
+	systemctl enable "$sys_file_name"

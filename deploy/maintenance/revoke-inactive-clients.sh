@@ -18,11 +18,11 @@ mkdir -p "$(dirname "$log_path")"
 [[ -r $db_path ]] || exit 0
 
 while IFS=', ' read -r user_name _ _ _ _ _ _ last_login _; do
-    [[ -n $user_name && $user_name != "openvpn-$env_name" ]] || continue
-    [[ ${last_login:-} =~ ^[0-9]+$ ]] || continue
-    if ((now - last_login > max_seconds)); then
-        printf '%s Revoke inactive user %s (last login: %s)\n' \
-            "$(date '+%F %H:%M:%S')" "$user_name" "$(date -d "@$last_login" '+%F')" | tee -a "$log_path"
-        ovpn deluser "$env_name" "$user_name"
-    fi
+	[[ -n $user_name && $user_name != "openvpn-$env_name" ]] || continue
+	[[ ${last_login:-} =~ ^[0-9]+$ ]] || continue
+	if ((now - last_login > max_seconds)); then
+		printf '%s Revoke inactive user %s (last login: %s)\n' \
+			"$(date '+%F %H:%M:%S')" "$user_name" "$(date -d "@$last_login" '+%F')" | tee -a "$log_path"
+		ovpn deluser "$env_name" "$user_name"
+	fi
 done <"$db_path"

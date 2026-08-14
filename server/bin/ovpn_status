@@ -1,11 +1,8 @@
 #!/bin/sh
 # 功能说明：持续输出 OpenVPN 状态日志，用于观察客户端连接状态。
 
-#
-# Get OpenVPN server status
-#
 if [ "${DEBUG:-}" = "1" ]; then
-  set -x
+	set -x
 fi
 
 set -e

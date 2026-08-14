@@ -1,58 +1,49 @@
 #!/bin/bash
 # 功能说明：为指定用户生成或重置 TOTP 密钥及二维码信息。
 
-#
-# Generate OpenVPN users via google authenticator
-#
-
 # shellcheck source=/dev/null
 if ! source "$OPENVPN/ovpn.env"; then
-    echo "Could not source $OPENVPN/ovpn.env."
-    exit 1
+	echo "Could not source $OPENVPN/ovpn.env."
+	exit 1
 fi
 
 if [ "${OTP:-false}" != "true" ]; then
-    echo "OTP authentication not enabled, please regenerate configuration using -2 flag"
-    exit 1
+	echo "OTP authentication not enabled, please regenerate configuration using -2 flag"
+	exit 1
 fi
 
 if [ -z "${1:-}" ]; then
-    echo "Usage: ovpn_otp_user USERNAME"
-    exit 1
+	echo "Usage: ovpn_otp_user USERNAME"
+	exit 1
 fi
 
-# Ensure the otp folder is present
 [ -d "$OPENVPN/otp" ] || mkdir -p "$OPENVPN/otp"
 
 otp_secret_file="$OPENVPN/otp/${1}.google_authenticator"
 otp_args=(
-    --time-based
-    --force
-    --qr-mode=NONE
-    -l "${1}@${OVPN_HOST}"
-    -i "$OVPN_HOST"
-    -s "$otp_secret_file"
+	--time-based
+	--force
+	--qr-mode=NONE
+	-l "${1}@${OVPN_HOST}"
+	-i "$OVPN_HOST"
+	-s "$otp_secret_file"
 )
 
-# Binary is present in image, save an $user.google_authenticator file in /etc/openvpn/otp
 if [ "${2:-}" == "interactive" ]; then
-    # Authenticator will ask for other parameters. User can choose rate limit, token reuse policy and time window policy
-    # Always use time base OTP otherwise storage for counters must be configured somewhere in volume
-    google-authenticator "${otp_args[@]}"
+	google-authenticator "${otp_args[@]}"
 else
-    # Skip confirmation if not running in interctive mode. Essential for integration tests.
-    google-authenticator "${otp_args[@]}" --disallow-reuse --rate-limit=3 --rate-time=30 \
-        --window-size=3 --no-confirm
+	google-authenticator "${otp_args[@]}" --disallow-reuse --rate-limit=3 --rate-time=30 \
+		--window-size=3 --no-confirm
 fi
 
 command -v qrencode >/dev/null 2>&1 || {
-    echo "qrencode is required to display the OTP QR code" >&2
-    exit 1
+	echo "qrencode is required to display the OTP QR code" >&2
+	exit 1
 }
 otp_secret=$(head -n 1 "$otp_secret_file")
 [ -n "$otp_secret" ] || {
-    echo "OTP secret was not generated for $1" >&2
-    exit 1
+	echo "OTP secret was not generated for $1" >&2
+	exit 1
 }
 otp_uri="otpauth://totp/${1}@${OVPN_HOST}?secret=${otp_secret}&issuer=${OVPN_HOST}"
 printf '\nOTP QR code for %s:\n' "$1"

@@ -13,7 +13,7 @@ mkdir -p "$(dirname "$log_path")"
 touch "$log_path"
 
 printf '%s User %s:%s from %s LOGGED OUT\n' \
-    "$(date '+%F %H:%M:%S')" \
-    "${common_name:-unknown}" \
-    "${ifconfig_pool_remote_ip:-unknown}" \
-    "${trusted_ip:-unknown}" | tee -a "$log_path"
+	"$(date '+%F %H:%M:%S')" \
+	"${common_name:-unknown}" \
+	"${ifconfig_pool_remote_ip:-unknown}" \
+	"${trusted_ip:-unknown}" | tee -a "$log_path"

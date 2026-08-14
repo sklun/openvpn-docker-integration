@@ -9,16 +9,22 @@ source "$OPENVPN/ovpn.env"
 
 cn=${1:-}
 format=${2:-combined}
-[[ -n $cn ]] || { echo "Usage: ovpn_getclient <name> [combined|combined-save|separated]" >&2; exit 1; }
-[[ -f $EASYRSA_PKI/private/$cn.key ]] || { echo "Client key not found: $cn" >&2; exit 1; }
+[[ -n $cn ]] || {
+	echo "Usage: ovpn_getclient <name> [combined|combined-save|separated]" >&2
+	exit 1
+}
+[[ -f $EASYRSA_PKI/private/$cn.key ]] || {
+	echo "Client key not found: $cn" >&2
+	exit 1
+}
 
 is_true() {
-    [[ ${1:-false} == "true" ]]
+	[[ ${1:-false} == "true" ]]
 }
 
 write_config() {
-    local mode=$1
-    cat <<EOF
+	local mode=$1
+	cat <<EOF
 client
 nobind
 dev $OVPN_DEVICE
@@ -26,15 +32,15 @@ remote-cert-tls server
 remote $OVPN_HOST $OVPN_PORT $OVPN_PROTO
 push-peer-info
 EOF
-    if [[ $OVPN_PROTO == udp6 ]]; then
-        echo "remote $OVPN_HOST $OVPN_PORT udp"
-    elif [[ $OVPN_PROTO == tcp6 ]]; then
-        echo "remote $OVPN_HOST $OVPN_PORT tcp"
-    fi
-    [[ $OVPN_PROTO == udp || $OVPN_PROTO == udp6 ]] && echo "explicit-exit-notify 1"
+	if [[ $OVPN_PROTO == udp6 ]]; then
+		echo "remote $OVPN_HOST $OVPN_PORT udp"
+	elif [[ $OVPN_PROTO == tcp6 ]]; then
+		echo "remote $OVPN_HOST $OVPN_PORT tcp"
+	fi
+	[[ $OVPN_PROTO == udp || $OVPN_PROTO == udp6 ]] && echo "explicit-exit-notify 1"
 
-    if [[ $mode == combined ]]; then
-        cat <<EOF
+	if [[ $mode == combined ]]; then
+		cat <<EOF
 <key>
 $(cat "$EASYRSA_PKI/private/$cn.key")
 </key>
@@ -49,46 +55,46 @@ key-direction 1
 $(cat "$EASYRSA_PKI/ta.key")
 </tls-auth>
 EOF
-    else
-        cat <<EOF
+	else
+		cat <<EOF
 key $cn.key
 cert $cn.crt
 ca ca.crt
 tls-auth ta.key 1
 EOF
-    fi
+	fi
 
-    is_true "${OVPN_DEFROUTE:-false}" && echo "redirect-gateway def1"
-    [[ -n ${OVPN_MTU:-} ]] && echo "tun-mtu $OVPN_MTU"
-    [[ -n ${OVPN_TLS_CIPHER:-} ]] && echo "tls-cipher $OVPN_TLS_CIPHER"
-    [[ -n ${OVPN_CIPHER:-} ]] && echo "data-ciphers-fallback $OVPN_CIPHER"
-    [[ -n ${OVPN_AUTH:-} ]] && echo "auth $OVPN_AUTH"
+	is_true "${OVPN_DEFROUTE:-false}" && echo "redirect-gateway def1"
+	[[ -n ${OVPN_MTU:-} ]] && echo "tun-mtu $OVPN_MTU"
+	[[ -n ${OVPN_TLS_CIPHER:-} ]] && echo "tls-cipher $OVPN_TLS_CIPHER"
+	[[ -n ${OVPN_CIPHER:-} ]] && echo "data-ciphers-fallback $OVPN_CIPHER"
+	[[ -n ${OVPN_AUTH:-} ]] && echo "auth $OVPN_AUTH"
 
-    if is_true "${OTP:-false}" || is_true "${PASSWORD_AUTH:-false}" || is_true "${LDAP:-false}"; then
-        echo "auth-user-pass"
-        echo "auth-nocache"
-        echo "reneg-sec 0"
-    fi
+	if is_true "${OTP:-false}" || is_true "${PASSWORD_AUTH:-false}" || is_true "${LDAP:-false}"; then
+		echo "auth-user-pass"
+		echo "auth-nocache"
+		echo "reneg-sec 0"
+	fi
 }
 
 output_dir="$OPENVPN/clients/$cn"
 case $format in
-    combined)
-        write_config combined
-        ;;
-    combined-save)
-        mkdir -p "$output_dir"
-        write_config combined >"$output_dir/$cn-$(date +%Y%m%d).ovpn"
-        ;;
-    separated)
-        mkdir -p "$output_dir"
-        write_config separated >"$output_dir/$cn.ovpn"
-        cp "$EASYRSA_PKI/private/$cn.key" "$output_dir/$cn.key"
-        cp "$EASYRSA_PKI/issued/$cn.crt" "$output_dir/$cn.crt"
-        cp "$EASYRSA_PKI/ca.crt" "$EASYRSA_PKI/ta.key" "$output_dir/"
-        ;;
-    *)
-        echo "Unknown format: $format" >&2
-        exit 1
-        ;;
+combined)
+	write_config combined
+	;;
+combined-save)
+	mkdir -p "$output_dir"
+	write_config combined >"$output_dir/$cn-$(date +%Y%m%d).ovpn"
+	;;
+separated)
+	mkdir -p "$output_dir"
+	write_config separated >"$output_dir/$cn.ovpn"
+	cp "$EASYRSA_PKI/private/$cn.key" "$output_dir/$cn.key"
+	cp "$EASYRSA_PKI/issued/$cn.crt" "$output_dir/$cn.crt"
+	cp "$EASYRSA_PKI/ca.crt" "$EASYRSA_PKI/ta.key" "$output_dir/"
+	;;
+*)
+	echo "Unknown format: $format" >&2
+	exit 1
+	;;
 esac

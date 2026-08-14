@@ -1,49 +1,45 @@
 #!/bin/bash
 # 功能说明：吊销指定客户端证书、更新证书吊销列表，并按需删除证书材料。
 
-#
-# Revoke a client certificate
-#
-
 if [ "${DEBUG:-}" == "1" ]; then
-    set -x
+	set -x
 fi
 
 set -e
 
 if [ -z "$OPENVPN" ]; then
-    export OPENVPN="$PWD"
+	export OPENVPN="$PWD"
 fi
 # shellcheck source=/dev/null
 if ! source "$OPENVPN/ovpn.env"; then
-    echo "Could not source $OPENVPN/ovpn.env."
-    exit 1
+	echo "Could not source $OPENVPN/ovpn.env."
+	exit 1
 fi
 if [ -z "$EASYRSA_PKI" ]; then
-    export EASYRSA_PKI="$OPENVPN/pki"
+	export EASYRSA_PKI="$OPENVPN/pki"
 fi
 
 cn="$1"
 remove=${2:-}
 
 if [ ! -f "$EASYRSA_PKI/private/${cn}.key" ]; then
-    echo "Unable to find \"${cn}\", please try again or generate the key first" >&2
-    exit 1
+	echo "Unable to find \"${cn}\", please try again or generate the key first" >&2
+	exit 1
 fi
 
 revoke_client_certificate() {
-    easyrsa --batch revoke "$1"
-    echo "Generating the Certificate Revocation List :"
-    easyrsa gen-crl
-    cp -f "$EASYRSA_PKI/crl.pem" "$OPENVPN/crl.pem"
-    chmod 644 "$OPENVPN/crl.pem"
+	easyrsa --batch revoke "$1"
+	echo "Generating the Certificate Revocation List :"
+	easyrsa gen-crl
+	cp -f "$EASYRSA_PKI/crl.pem" "$OPENVPN/crl.pem"
+	chmod 644 "$OPENVPN/crl.pem"
 }
 
 revoke_client_certificate "$cn"
 
 if [ "$remove" = "remove" ]; then
-    rm -f \
-        "$EASYRSA_PKI/private/${cn}.key" \
-        "$EASYRSA_PKI/issued/${cn}.crt" \
-        "$EASYRSA_PKI/reqs/${cn}.req"
+	rm -f \
+		"$EASYRSA_PKI/private/${cn}.key" \
+		"$EASYRSA_PKI/issued/${cn}.crt" \
+		"$EASYRSA_PKI/reqs/${cn}.req"
 fi

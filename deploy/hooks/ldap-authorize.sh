@@ -15,19 +15,19 @@ user_name=$(head -n 1 "$credential_file")
 
 authz_file=${LDAP_AUTHZ_FILE:-$OPENVPN/auth/vpn_user.json}
 if [[ ! -r $authz_file ]]; then
-    echo "LDAP authorization file not found: $authz_file" >&2
-    exit 1
+	echo "LDAP authorization file not found: $authz_file" >&2
+	exit 1
 fi
 
 if jq -e --arg user "$user_name" '.LDAP_user[]? | select(.user == $user)' "$authz_file" >/dev/null; then
-    ccd_file="$OPENVPN/ccd/$user_name"
-    if [[ ! -f $ccd_file ]]; then
-        cp "$OPENVPN/templates/ccd/default" "$ccd_file"
-    fi
-    exit 0
+	ccd_file="$OPENVPN/ccd/$user_name"
+	if [[ ! -f $ccd_file ]]; then
+		cp "$OPENVPN/templates/ccd/default" "$ccd_file"
+	fi
+	exit 0
 fi
 
 if [[ -n ${auth_failed_reason_file:-} ]]; then
-    printf 'User %s is not authorized for VPN access\n' "$user_name" >"$auth_failed_reason_file"
+	printf 'User %s is not authorized for VPN access\n' "$user_name" >"$auth_failed_reason_file"
 fi
 exit 1

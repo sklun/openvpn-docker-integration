@@ -1,23 +1,23 @@
 FROM alpine
 
 RUN apk add --no-cache \
-        bash \
-        curl \
-        easy-rsa \
-        iproute2 \
-        ipset \
-        iptables \
-        iptables-legacy \
-        jq \
-        libqrencode-tools \
-        logrotate \
-        openvpn \
-        openvpn-auth-ldap \
-        openvpn-auth-pam \
-        google-authenticator \
-        tzdata \
-        ulogd \
-        util-linux \
+    bash \
+    curl \
+    easy-rsa \
+    iproute2 \
+    ipset \
+    iptables \
+    iptables-legacy \
+    jq \
+    libqrencode-tools \
+    logrotate \
+    openvpn \
+    openvpn-auth-ldap \
+    openvpn-auth-pam \
+    google-authenticator \
+    tzdata \
+    ulogd \
+    util-linux \
     && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone \
     && ln -s /usr/share/easy-rsa/easyrsa /usr/local/bin/easyrsa

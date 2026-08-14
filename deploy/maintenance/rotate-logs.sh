@@ -14,14 +14,14 @@ log_dir="$local_path/logs"
 disk_limit=${LOG_DISK_LIMIT:-90}
 log_names=(iptables.log openvpn.log)
 
-while (( $(df -P "$log_dir" | awk 'NR == 2 { gsub("%", "", $5); print $5 }') >= disk_limit )); do
-    removed=false
-    for log_name in "${log_names[@]}"; do
-        oldest=$(find "$log_dir" -maxdepth 1 -type f -name "${log_name}-*.gz" -print | sort | head -n 1)
-        if [[ -n $oldest ]]; then
-            rm -f "$oldest"
-            removed=true
-        fi
-    done
-    $removed || break
+while (($(df -P "$log_dir" | awk 'NR == 2 { gsub("%", "", $5); print $5 }') >= disk_limit)); do
+	removed=false
+	for log_name in "${log_names[@]}"; do
+		oldest=$(find "$log_dir" -maxdepth 1 -type f -name "${log_name}-*.gz" -print | sort | head -n 1)
+		if [[ -n $oldest ]]; then
+			rm -f "$oldest"
+			removed=true
+		fi
+	done
+	$removed || break
 done
