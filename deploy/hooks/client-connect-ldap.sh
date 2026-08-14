@@ -19,30 +19,35 @@ lock_file="$OPENVPN/state/.client-ip.lock"
 
 mkdir -p "$(dirname "$log_path")" "$OPENVPN/ccd"
 touch "$log_path" "$db_path" "$history_path" "$ccd_file"
+[[ -n ${ifconfig_pool_remote_ip:-} && -n ${ifconfig_pool_netmask:-} ]] || exit 1
 
-exec 200>"$lock_file"
-flock -w 5 200 || { echo "Unable to lock client IP state" >&2; exit 1; }
+{
+	flock -w 5 200 || {
+		echo "Unable to lock client IP state" >&2
+		exit 1
+	}
 
-if ! grep -q '^ifconfig-push ' "$ccd_file"; then
-    [[ -n ${ifconfig_pool_remote_ip:-} && -n ${ifconfig_pool_netmask:-} ]] || exit 1
-    temp=$(mktemp "${ccd_file}.XXXXXX")
-    {
-        printf 'ifconfig-push %s %s\n' "$ifconfig_pool_remote_ip" "$ifconfig_pool_netmask"
-        cat "$ccd_file"
-    } >"$temp"
-    mv "$temp" "$ccd_file"
-fi
+	if ! grep -q '^ifconfig-push ' "$ccd_file"; then
+		temp=$(mktemp "${ccd_file}.XXXXXX")
+		{
+			printf 'ifconfig-push %s %s\n' "$ifconfig_pool_remote_ip" "$ifconfig_pool_netmask"
+			cat "$ccd_file"
+		} >"$temp"
+		mv "$temp" "$ccd_file"
+	fi
 
-if ! awk -F', ' -v user="$common_name" '$1 == user { found = 1 } END { exit !found }' "$db_path"; then
-    record="$common_name, $ifconfig_pool_remote_ip, , , , , , $(date +%s)"
-    printf '%s\n' "$record" >>"$db_path"
-    printf '%s\n' "$record" >>"$history_path"
-fi
+	client_ip=$(awk -F', ' -v user="$common_name" '$1 == user { print $2; exit }' "$db_path")
+	if [[ -z $client_ip ]]; then
+		client_ip=$ifconfig_pool_remote_ip
+		record="$common_name, $client_ip, , , , , , $(date +%s)"
+		printf '%s\n' "$record" >>"$db_path"
+		printf '%s\n' "$record" >>"$history_path"
+	fi
+} 200>"$lock_file"
 
 if [[ ${IPTABLES_POLICY:-false} == true ]]; then
-	ovpn_firewall sync-rules "$db_path" "$OPENVPN/ccd"
+	ovpn_firewall ensure-user "$common_name" "$client_ip" "$ccd_file"
 fi
 
-flock -u 200
 printf '%s User %s:%s from %s LOGGED IN\n' \
-    "$log_time" "$common_name" "$ifconfig_pool_remote_ip" "${trusted_ip:-unknown}" | tee -a "$log_path"
+	"$log_time" "$common_name" "$client_ip" "${trusted_ip:-unknown}" | tee -a "$log_path"

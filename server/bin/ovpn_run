@@ -9,19 +9,17 @@ source "$OPENVPN/ovpn.env"
 
 mkdir -p /dev/net "$OPENVPN"/{ccd,config,hooks,logs,state}
 [[ -c /dev/net/tun ]] || mknod /dev/net/tun c 10 200
-selected_backend=$(ovpn_firewall select)
-echo "Selected iptables backend: $selected_backend"
 
 if [[ -f $EASYRSA_PKI/crl.pem && $EASYRSA_PKI/crl.pem -nt $OPENVPN/crl.pem ]]; then
-    cp -f "$EASYRSA_PKI/crl.pem" "$OPENVPN/crl.pem"
-    chmod 644 "$OPENVPN/crl.pem"
+	cp -f "$EASYRSA_PKI/crl.pem" "$OPENVPN/crl.pem"
+	chmod 644 "$OPENVPN/crl.pem"
 fi
 
 ovpn_firewall sync-rules "$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd"
 
 if [[ -f $OPENVPN/config/ulogd.conf ]]; then
-    cp "$OPENVPN/config/ulogd.conf" /etc/ulogd.conf
-    ulogd -d
+	cp "$OPENVPN/config/ulogd.conf" /etc/ulogd.conf
+	ulogd -d
 fi
 
 args=(--config "$OPENVPN/openvpn.conf")

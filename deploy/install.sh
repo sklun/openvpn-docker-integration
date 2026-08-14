@@ -107,9 +107,9 @@ validate_config() {
 	tcp | tcp6) OVPN_PORT_PROTO=tcp ;;
 	*) fail "OVPN_PROTO must be udp, udp6, tcp or tcp6" ;;
 	esac
-	case ${OVPN_IPTABLES_BACKEND:-auto} in
-	auto | nft | legacy) ;;
-	*) fail "OVPN_IPTABLES_BACKEND must be auto, nft or legacy" ;;
+	case ${OVPN_IPTABLES_BACKEND:-} in
+	"" | nft | legacy) ;;
+	*) fail "OVPN_IPTABLES_BACKEND must be empty, nft or legacy" ;;
 	esac
 	client_prefix=${OVPN_CLIENT_SUBNET#*/}
 	((10#$client_prefix >= 1)) || fail "OVPN_CLIENT_SUBNET prefix must be between 1 and 29"

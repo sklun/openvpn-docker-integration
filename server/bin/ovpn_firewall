@@ -5,15 +5,10 @@ set -euo pipefail
 
 OPENVPN=${OPENVPN:-/etc/openvpn}
 ENV_FILE="$OPENVPN/ovpn.env"
-# shellcheck source=/dev/null
-[[ ! -r $ENV_FILE ]] || source "$ENV_FILE"
-
 STATE_DIR="$OPENVPN/state"
-BACKEND_FILE="$STATE_DIR/iptables.backend"
 BACKUP_BACKEND_FILE="$STATE_DIR/iptables.rules.backend"
-REQUESTED_BACKEND=${OVPN_IPTABLES_BACKEND:-auto}
-PROBE_CHAIN="OVPNFW$$"
-PROBE_SET="ovpn-fw-$$"
+PROBE_CHAIN="OVPNFWPROBE"
+PROBE_SET="ovpn-fw-probe"
 
 fail() {
 	echo "Error: $*" >&2
@@ -23,11 +18,16 @@ fail() {
 mkdir -p "$STATE_DIR"
 exec 9>"${STATE_DIR}/iptables.lock"
 flock -w 30 9 || fail "timed out waiting for the iptables backend lock"
+# ovpn.env 是唯一环境变量入口。加锁后加载，避免等待锁期间读取到旧值。
+# shellcheck source=/dev/null
+[[ ! -r $ENV_FILE ]] || source "$ENV_FILE"
 
 is_true() {
 	[[ ${1:-false} == true ]]
 }
 
+# 将逻辑后端名称解析为成对的规则命令和保存命令，不修改任何运行规则。
+# legacy 兼容显式 iptables-legacy，也兼容没有多前端标记的经典 iptables。
 resolve_backend_commands() {
 	local backend=$1 version
 
@@ -53,6 +53,7 @@ resolve_backend_commands() {
 	SELECTED_BACKEND=$backend
 }
 
+# 清理探测资源；固定名称使后续进程也能清除异常退出产生的残留。
 cleanup_probe() {
 	"$IPTABLES" -t filter -F "$PROBE_CHAIN" >/dev/null 2>&1 || true
 	"$IPTABLES" -t filter -X "$PROBE_CHAIN" >/dev/null 2>&1 || true
@@ -61,8 +62,11 @@ cleanup_probe() {
 	ipset destroy "$PROBE_SET" >/dev/null 2>&1 || true
 }
 
+# 对当前 resolve_backend_commands 选中的前端执行真实能力探测。
+# 临时链不挂接到内建链，因此不会命中实际流量；探测成功或失败都会立即清理。
 probe_backend() {
 	cleanup_probe
+	# 基础访问策略依赖 ipset、set match 和 comment 扩展。
 	ipset create "$PROBE_SET" hash:net >/dev/null 2>&1 || return 1
 	"$IPTABLES" -t filter -N "$PROBE_CHAIN" >/dev/null 2>&1 || {
 		cleanup_probe
@@ -74,6 +78,7 @@ probe_backend() {
 		return 1
 	}
 	if is_true "${IPTABLES_POLICY:-false}"; then
+		# 启用访问策略时还需要 NFLOG 记录客户端 TCP 连接请求。
 		"$IPTABLES" -t filter -A "$PROBE_CHAIN" -p tcp --tcp-flags FIN,SYN,RST,ACK SYN \
 			-j NFLOG --nflog-prefix ovpn-probe --nflog-group 16 >/dev/null 2>&1 || {
 			cleanup_probe
@@ -81,11 +86,16 @@ probe_backend() {
 		}
 	fi
 	if is_true "${OVPN_NAT:-false}"; then
+		# 仅在启用 NAT 时验证 nat 表和 MASQUERADE target，避免无关能力阻止启动。
 		"$IPTABLES" -t nat -N "$PROBE_CHAIN" >/dev/null 2>&1 || {
 			cleanup_probe
 			return 1
 		}
-		"$IPTABLES" -t nat -A "$PROBE_CHAIN" -s 192.0.2.1/32 -j MASQUERADE \
+		# 192.0.2.1 belongs to TEST-NET-1. This unreferenced temporary chain only
+		# verifies that the selected backend can create MASQUERADE rules; it never
+		# carries VPN traffic and cleanup_probe removes it immediately after probing.
+		"$IPTABLES" -t nat -A "$PROBE_CHAIN" -s 192.0.2.1/32 \
+			-m comment --comment "OpenVPN NAT backend probe" -j MASQUERADE \
 			>/dev/null 2>&1 || {
 			cleanup_probe
 			return 1
@@ -94,57 +104,59 @@ probe_backend() {
 	cleanup_probe
 }
 
+# 将探测结果写回唯一环境变量入口；缺少配置项时提示并补充。
 write_backend() {
-	local temp
-	temp=$(mktemp "$BACKEND_FILE.XXXXXX")
-	printf '%s\n' "$SELECTED_BACKEND" >"$temp"
-	mv "$temp" "$BACKEND_FILE"
+	if grep -q '^OVPN_IPTABLES_BACKEND=' "$ENV_FILE"; then
+		sed -i "s/^OVPN_IPTABLES_BACKEND=.*/OVPN_IPTABLES_BACKEND=\"$SELECTED_BACKEND\"/" "$ENV_FILE"
+	else
+		echo "Warning: OVPN_IPTABLES_BACKEND is missing from $ENV_FILE; appending it" >&2
+		printf '\nOVPN_IPTABLES_BACKEND="%s"\n' "$SELECTED_BACKEND" >>"$ENV_FILE"
+	fi
+	OVPN_IPTABLES_BACKEND=$SELECTED_BACKEND
 }
 
-select_backend() {
-	local backend persisted=""
-	local -a candidates=()
-
-	case $REQUESTED_BACKEND in
-	auto | nft | legacy) ;;
-	*) fail "OVPN_IPTABLES_BACKEND must be auto, nft or legacy" ;;
-	esac
-
-	[[ ! -r $BACKEND_FILE ]] || read -r persisted <"$BACKEND_FILE"
-	if [[ $REQUESTED_BACKEND == auto ]]; then
-		[[ $persisted != nft && $persisted != legacy ]] || candidates+=("$persisted")
-		[[ $persisted == nft ]] || candidates+=(nft)
-		[[ $persisted == legacy ]] || candidates+=(legacy)
-	else
-		candidates=("$REQUESTED_BACKEND")
-	fi
-
-	for backend in "${candidates[@]}"; do
+# 仅在配置为空或已记录后端的命令对不可用时调用。
+# 候选始终按 nft、legacy 排列；每个候选都完成真实能力探测后才能写回。
+detect_backend() {
+	local backend
+	for backend in nft legacy; do
+		resolve_backend_commands "$backend" && cleanup_probe
+	done
+	for backend in nft legacy; do
 		if resolve_backend_commands "$backend" && probe_backend; then
 			write_backend
-			printf '%s\n' "$SELECTED_BACKEND"
 			return 0
 		fi
 	done
-	fail "no usable iptables backend found (requested: $REQUESTED_BACKEND)"
+	fail "no usable iptables backend found"
 }
 
+# 为普通规则操作加载后端命令。空值表示尚未探测；nft/legacy 且命令对
+# 可用时直接复用，不创建临时链。只有空值或命令对不可用时才重新探测并回写。
 ensure_backend() {
-	local persisted=""
-	[[ ! -r $BACKEND_FILE ]] || read -r persisted <"$BACKEND_FILE"
-	if [[ $persisted == nft || $persisted == legacy ]]; then
-		if [[ $REQUESTED_BACKEND == auto || $REQUESTED_BACKEND == "$persisted" ]] &&
-			resolve_backend_commands "$persisted"; then
-			return 0
-		fi
-	fi
-	select_backend >/dev/null
-	resolve_backend_commands "$(<"$BACKEND_FILE")" || fail "selected iptables backend is unavailable"
+	local configured=${OVPN_IPTABLES_BACKEND:-}
+	case $configured in
+	"") ;;
+	nft | legacy)
+		resolve_backend_commands "$configured" && return 0
+		;;
+	*) fail "OVPN_IPTABLES_BACKEND must be empty, nft or legacy" ;;
+	esac
+
+	detect_backend
+}
+
+# 统一规则审计快照权限，避免容器内 root 原子替换文件后改变运行目录属主约定。
+set_snapshot_ownership() {
+	local snapshot
+	for snapshot in "$@"; do
+		chmod 600 "$snapshot"
+		chown 65534:65534 "$snapshot"
+	done
 }
 
 save_rules() {
 	local target=$1 temp metadata_temp
-	ensure_backend
 	temp=$(mktemp "$target.XXXXXX")
 	metadata_temp=$(mktemp "$BACKUP_BACKEND_FILE.XXXXXX")
 	if ! "$IPTABLES_SAVE" >"$temp"; then
@@ -154,6 +166,7 @@ save_rules() {
 	printf '%s\n' "$SELECTED_BACKEND" >"$metadata_temp"
 	mv "$temp" "$target"
 	mv "$metadata_temp" "$BACKUP_BACKEND_FILE"
+	set_snapshot_ownership "$target" "$BACKUP_BACKEND_FILE"
 }
 
 valid_ipv4() {
@@ -174,11 +187,11 @@ valid_ipv4_cidr() {
 	valid_ipv4 "$ip" && [[ $prefix =~ ^([0-9]|[12][0-9]|3[0-2])$ ]]
 }
 
-delete_postrouting_masquerade_rules() {
+delete_managed_masquerade_rules() {
 	local line
 	while :; do
 		line=$("$IPTABLES" -t nat -nvL POSTROUTING --line-numbers |
-			awk '$4 == "MASQUERADE" { print $1; exit }')
+			awk 'index($0, "/* openvpn client masquerade */") { print $1; exit }')
 		[[ -n $line ]] || break
 		"$IPTABLES" -t nat -D POSTROUTING "$line"
 	done
@@ -186,10 +199,7 @@ delete_postrouting_masquerade_rules() {
 
 sync_nat_rules() {
 	local enabled=$1 client_subnet=$2 device=$3
-	validate_nat_config "$enabled" "$client_subnet" "$device"
-	ensure_backend
-
-	delete_postrouting_masquerade_rules
+	delete_managed_masquerade_rules
 
 	if [[ $enabled == true ]]; then
 		"$IPTABLES" -t nat -A POSTROUTING -s "$client_subnet" -o "$device" \
@@ -248,7 +258,7 @@ delete_forward_rules_by_comment() {
 	while :; do
 		line=$("$IPTABLES" -nvL FORWARD --line-numbers |
 			awk -v comment="$comment" \
-			'index($0, "/* " comment " */") { print $1; exit }')
+				'index($0, "/* " comment " */") { print $1; exit }')
 		[[ -n $line ]] || break
 		"$IPTABLES" -D FORWARD "$line"
 	done
@@ -262,6 +272,18 @@ delete_managed_user_forward_rules() {
 		[[ -n $line ]] || break
 		"$IPTABLES" -D FORWARD "$line"
 	done
+}
+
+delete_user_forward_rules() {
+	local user=$1
+	delete_forward_rules_by_comment "allow $user route group"
+}
+
+destroy_user_ipset() {
+	local user=$1
+	if ipset list "$user" >/dev/null 2>&1; then
+		ipset destroy "$user"
+	fi
 }
 
 destroy_all_ipsets() {
@@ -279,6 +301,7 @@ save_ipset_snapshot() {
 		return 1
 	fi
 	mv "$temp" "$target"
+	set_snapshot_ownership "$target"
 }
 
 save_snapshots() {
@@ -290,7 +313,7 @@ update_routes() {
 	local action=$1 user route index route_index
 	shift
 	[[ $action == add || $action == delete ]] || fail "route action must be add or delete"
-	(( $# > 0 && $# % 2 == 0 )) ||
+	(($# > 0 && $# % 2 == 0)) ||
 		fail "route updates must contain USER CIDR pairs"
 	for ((index = 1; index <= $#; index += 2)); do
 		user=${!index}
@@ -346,6 +369,66 @@ create_user_rules() {
 	done
 }
 
+user_rules_current() {
+	local user=$1 client_ip=$2 ccd_file=$3 expected actual
+	ipset list "$user" >/dev/null 2>&1 || return 1
+	"$IPTABLES" -nvL FORWARD | awk -v comment="allow $user route group" -v source="$client_ip" '
+		index($0, "/* " comment " */") {
+			for (i = 1; i <= NF; i++) {
+				if ($i == source || $i == source "/32") found = 1
+			}
+		}
+		END { exit !found }
+	' || return 1
+
+	expected=$(awk '/^push "route / { gsub(/"/, ""); print $3, $4 }' "$ccd_file" |
+		while read -r route_ip route_mask; do
+			printf '%s/%s\n' "$route_ip" "$(mask_to_cidr "$route_mask")"
+		done | sort -u)
+	actual=$(ipset save "$user" | awk '$1 == "add" { print $3 }' | sort -u) || return 1
+	[[ $actual == "$expected" ]]
+}
+
+sync_user_rules() {
+	local user=$1 client_ip=$2 ccd_file=$3
+	[[ ${IPTABLES_POLICY:-false} == true || ${IPTABLES_POLICY:-false} == false ]] ||
+		fail "IPTABLES_POLICY must be true or false"
+	validate_user_routes "$user" "$client_ip" "$ccd_file"
+	ensure_backend
+	delete_user_forward_rules "$user"
+	destroy_user_ipset "$user"
+	if is_true "${IPTABLES_POLICY:-false}"; then
+		create_user_rules "$user" "$client_ip" "$ccd_file"
+	fi
+	save_snapshots
+}
+
+ensure_user_rules() {
+	local user=$1 client_ip=$2 ccd_file=$3
+	[[ ${IPTABLES_POLICY:-false} == true || ${IPTABLES_POLICY:-false} == false ]] ||
+		fail "IPTABLES_POLICY must be true or false"
+	validate_user_routes "$user" "$client_ip" "$ccd_file"
+	ensure_backend
+	if is_true "${IPTABLES_POLICY:-false}" && user_rules_current "$user" "$client_ip" "$ccd_file"; then
+		return 0
+	fi
+	delete_user_forward_rules "$user"
+	destroy_user_ipset "$user"
+	if is_true "${IPTABLES_POLICY:-false}"; then
+		create_user_rules "$user" "$client_ip" "$ccd_file"
+	fi
+	save_snapshots
+}
+
+delete_user_rules() {
+	local user=$1
+	[[ $user =~ ^[a-zA-Z][a-zA-Z0-9._-]{0,30}$ ]] || fail "invalid user name: $user"
+	ensure_backend
+	delete_user_forward_rules "$user"
+	destroy_user_ipset "$user"
+	save_snapshots
+}
+
 sync_all_rules() {
 	local client_db=$1 ccd_dir=$2 ccd user client_ip i
 	local -a users=() client_ips=() ccd_files=()
@@ -391,12 +474,12 @@ sync_all_rules() {
 	save_snapshots
 }
 
-command_name=${1:-info}
-shift || true
+(($# > 0)) || fail "Usage: ovpn_firewall COMMAND [ARGS...]"
+command_name=$1
+shift
 
 case $command_name in
-select) select_backend ;;
-info)
+ensure-backend)
 	ensure_backend
 	printf '%s\n' "$SELECTED_BACKEND"
 	;;
@@ -407,6 +490,18 @@ iptables)
 sync-rules)
 	[[ $# -eq 2 ]] || fail "Usage: ovpn_firewall sync-rules CLIENT_DB CCD_DIR"
 	sync_all_rules "$1" "$2"
+	;;
+sync-user)
+	[[ $# -eq 3 ]] || fail "Usage: ovpn_firewall sync-user USER CLIENT_IP CCD_FILE"
+	sync_user_rules "$1" "$2" "$3"
+	;;
+ensure-user)
+	[[ $# -eq 3 ]] || fail "Usage: ovpn_firewall ensure-user USER CLIENT_IP CCD_FILE"
+	ensure_user_rules "$1" "$2" "$3"
+	;;
+delete-user)
+	[[ $# -eq 1 ]] || fail "Usage: ovpn_firewall delete-user USER"
+	delete_user_rules "$1"
 	;;
 update-routes)
 	[[ $# -ge 3 ]] || fail "Usage: ovpn_firewall update-routes ACTION USER CIDR [USER CIDR...]"

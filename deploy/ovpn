@@ -231,9 +231,7 @@ resolve_domain_ipv4() {
 ipv4_to_int() {
 	local a b c d
 	IFS=. read -r a b c d <<<"$1"
-	# printf '%u\n' "$(((10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d))"
 	printf '%u\n' "$((10#$a * 16777216 + 10#$b * 65536 + 10#$c * 256 + 10#$d))"
-
 }
 
 # 将 IPv4 无符号整数转换为点分十进制地址。
@@ -301,7 +299,7 @@ set_runtime_ownership() {
 	done
 }
 
-# 按指定分隔格式原子删除文件中属于目标用户的记录。
+# 按指定分隔格式删除文件中属于目标用户的记录。
 atomic_without_user() {
 	local file=$1 user=$2 delimiter=${3:-plain} temp
 	temp=$(mktemp "${file}.XXXXXX")
@@ -316,43 +314,66 @@ atomic_without_user() {
 	secure_file "$file"
 }
 
+# 在客户端状态锁内删除当前记录，并按需删除历史记录。
+remove_client_state() {
+	local user=$1 remove_history=${2:-false} remove_ccd=${3:-false}
+	{
+		flock -w 10 200 || fail "无法锁定客户端 IP 状态文件"
+		[[ $remove_ccd != true ]] || rm -f "$CCD_DIR/$user"
+		atomic_without_user "$CLIENT_DB" "$user" csv
+		if [[ $remove_history == true ]]; then
+			atomic_without_user "$CLIENT_HISTORY" "$user" csv
+		fi
+	} 200>"$LOCAL_PATH/state/.client-ip.lock"
+}
+
 # 为用户分配未占用的固定 IP，并同步状态记录和 CCD。
 assign_client_ip() {
-	local first last candidate candidate_ip prefix mask lock_file
+	local first last candidate candidate_ip prefix mask temp
 	first=$(ipv4_to_int "$SUBNET_IP_FIRST")
 	last=$(ipv4_to_int "$SUBNET_IP_LAST")
 	prefix=${OVPN_CLIENT_SUBNET#*/}
 	mask=$(cidr_to_mask "$prefix") || fail "客户端网段的 CIDR 前缀无效: $OVPN_CLIENT_SUBNET"
-	lock_file="$LOCAL_PATH/state/.client-ip.lock"
-	exec 200>"$lock_file"
-	flock -w 10 200 || fail "无法锁定客户端 IP 状态文件"
-
-	for ((candidate = first + 1; candidate <= last; candidate++)); do
-		candidate_ip=$(int_to_ipv4 "$candidate")
-		if ! awk -F', ' -v ip="$candidate_ip" '$2 == ip { found = 1 } END { exit found ? 0 : 1 }' "$CLIENT_DB"; then
-			printf '%s, %s, , , , , , %s\n' "$CLIENT_NAME" "$candidate_ip" "$(date +%s)" >>"$CLIENT_DB"
-			printf '%s, %s, , , , , , %s\n' "$CLIENT_NAME" "$candidate_ip" "$(date +%s)" >>"$CLIENT_HISTORY"
-			temp=$(mktemp "${CLIENT_CCD}.XXXXXX")
-			{
-				printf 'ifconfig-push %s %s\n' "$candidate_ip" "$mask"
-				cat "$CLIENT_CCD"
-			} >"$temp"
-			mv "$temp" "$CLIENT_CCD"
-			CLIENT_IP=$candidate_ip
-			flock -u 200
-			return 0
-		fi
-	done
-	flock -u 200
-	fail "客户端网段没有可用地址: $OVPN_CLIENT_SUBNET"
+	{
+		flock -w 10 200 || fail "无法锁定客户端 IP 状态文件"
+		for ((candidate = first + 1; candidate <= last; candidate++)); do
+			candidate_ip=$(int_to_ipv4 "$candidate")
+			if ! awk -F', ' -v ip="$candidate_ip" '$2 == ip { found = 1 } END { exit found ? 0 : 1 }' "$CLIENT_DB"; then
+				printf '%s, %s, , , , , , %s\n' "$CLIENT_NAME" "$candidate_ip" "$(date +%s)" >>"$CLIENT_DB"
+				printf '%s, %s, , , , , , %s\n' "$CLIENT_NAME" "$candidate_ip" "$(date +%s)" >>"$CLIENT_HISTORY"
+				temp=$(mktemp "${CLIENT_CCD}.XXXXXX")
+				{
+					printf 'ifconfig-push %s %s\n' "$candidate_ip" "$mask"
+					cat "$CLIENT_CCD"
+				} >"$temp"
+				mv "$temp" "$CLIENT_CCD"
+				CLIENT_IP=$candidate_ip
+				return 0
+			fi
+		done
+		fail "客户端网段没有可用地址: $OVPN_CLIENT_SUBNET"
+	} 200>"$LOCAL_PATH/state/.client-ip.lock"
 }
 
-# 根据当前用户状态和 CCD 重建访问规则。
-create_access_rules() {
+# 根据目标用户状态和 CCD 增量创建或重建访问规则。
+sync_user_access_rules() {
+	local user=$1 client_ip ccd_path
 	require_running
-	log_info "根据当前用户状态重建访问规则"
-	docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
-		"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd"
+	client_ip=$(awk -F', ' -v user="$user" '$1 == user { print $2; exit }' "$CLIENT_DB")
+	[[ -n $client_ip ]] || fail "找不到用户客户端 IP: $user"
+	ccd_path="$CCD_DIR/$user"
+	[[ -f $ccd_path ]] || fail "找不到用户 CCD: $user"
+	log_info "增量同步用户访问规则: $user"
+	docker exec "$CONTAINER_NAME" ovpn_firewall sync-user \
+		"$user" "$client_ip" "$OPENVPN/ccd/$user"
+}
+
+# 增量删除目标用户的访问规则。
+delete_user_access_rules() {
+	local user=$1
+	require_running
+	log_info "增量删除用户访问规则: $user"
+	docker exec "$CONTAINER_NAME" ovpn_firewall delete-user "$user"
 }
 
 # 回滚创建失败的用户，避免遗留不可用证书、状态记录和访问规则。
@@ -368,18 +389,16 @@ rollback_created_user() {
 	fi
 	rm -rf "$CLIENT_OUTPUT"
 	rm -f \
-		"$CLIENT_CCD" \
 		"$LOCAL_PATH/otp/$CLIENT_NAME.google_authenticator" \
 		"$LOCAL_PATH/pki/private/$CLIENT_NAME.key" \
 		"$LOCAL_PATH/pki/issued/$CLIENT_NAME.crt" \
 		"$LOCAL_PATH/pki/reqs/$CLIENT_NAME.req" \
 		"$LOCAL_PATH/pki/inline/private/$CLIENT_NAME.inline"
-	atomic_without_user "$CLIENT_DB" "$CLIENT_NAME" csv
-	atomic_without_user "$CLIENT_HISTORY" "$CLIENT_NAME" csv
+	remove_client_state "$CLIENT_NAME" true true
 	remove_password_user "$CLIENT_NAME"
 	if container_running; then
-		docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
-			"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd" >/dev/null 2>&1 || true
+		docker exec "$CONTAINER_NAME" ovpn_firewall delete-user \
+			"$CLIENT_NAME" >/dev/null 2>&1 || true
 	fi
 	set_runtime_ownership
 	log_info "用户创建回滚完成: $CLIENT_NAME"
@@ -414,7 +433,7 @@ create_user() {
 	log_info "分配固定 IP 并写入访问规则"
 	cp "$DEFAULT_CCD" "$CLIENT_CCD"
 	assign_client_ip
-	create_access_rules
+	sync_user_access_rules "$CLIENT_NAME"
 	set_runtime_ownership
 	trap 'handle_error "$?" "$LINENO"' ERR
 	log_success "用户创建完成: ${CLIENT_NAME}（客户端 IP: ${CLIENT_IP}）"
@@ -435,13 +454,21 @@ renew_user() {
 	log_success "用户证书更新完成: $CLIENT_NAME"
 }
 
-# 从固定密码用户名单和密码文件中删除指定用户。
-remove_password_user() {
+# 从固定密码用户名单和密码文件中删除指定用户，调用方必须持有密码锁。
+remove_password_user_unlocked() {
 	local user=$1
 	secure_file "$PASSWORD_USERS_FILE"
 	secure_file "$PASSWORD_FILE"
 	atomic_without_user "$PASSWORD_USERS_FILE" "$user"
 	atomic_without_user "$PASSWORD_FILE" "$user" colon
+}
+
+remove_password_user() {
+	local user=$1
+	{
+		flock -w 10 201 || fail "无法锁定固定密码状态文件"
+		remove_password_user_unlocked "$user"
+	} 201>"$LOCAL_PATH/auth/.static-password.lock"
 }
 
 # 吊销证书并删除用户的配置、认证数据和访问规则。
@@ -454,14 +481,11 @@ delete_user() {
 	docker run --rm -i -v "$LOCAL_PATH:$OPENVPN" -e "OPENVPN=$OPENVPN" \
 		"$OVPN_IMAGE" ovpn_revokeclient "$CLIENT_NAME" remove
 	rm -rf "$CLIENT_OUTPUT"
-	rm -f "$CLIENT_CCD"
-	atomic_without_user "$CLIENT_DB" "$CLIENT_NAME" csv
+	remove_client_state "$CLIENT_NAME" false true
 	remove_password_user "$CLIENT_NAME"
 
 	if container_running; then
-		log_info "根据当前用户状态重建访问规则"
-		docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
-			"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd"
+		delete_user_access_rules "$CLIENT_NAME"
 	else
 		log_info "容器未运行，跳过运行时访问规则清理"
 	fi
@@ -525,54 +549,57 @@ add_password_user() {
 	[[ -f $CLIENT_CERT ]] || fail "VPN 用户不存在: $CLIENT_NAME"
 	log_start "添加固定密码用户: ${CLIENT_NAME}（环境: ${ENV_NAME}）"
 	read_password
-	secure_file "$PASSWORD_USERS_FILE"
-	secure_file "$PASSWORD_FILE"
-	exec 201>"$LOCAL_PATH/auth/.static-password.lock"
-	flock -w 10 201 || fail "无法锁定固定密码状态文件"
-	grep -Fxq "$CLIENT_NAME" "$PASSWORD_USERS_FILE" && fail "固定密码用户已存在: $CLIENT_NAME"
-	printf '%s\n' "$CLIENT_NAME" >>"$PASSWORD_USERS_FILE"
-	printf '%s:%s\n' "$CLIENT_NAME" "$PASSWORD_VALUE" >>"$PASSWORD_FILE"
-	secure_file "$PASSWORD_USERS_FILE"
-	secure_file "$PASSWORD_FILE"
-	flock -u 201
+	{
+		flock -w 10 201 || fail "无法锁定固定密码状态文件"
+		secure_file "$PASSWORD_USERS_FILE"
+		secure_file "$PASSWORD_FILE"
+		grep -Fxq "$CLIENT_NAME" "$PASSWORD_USERS_FILE" && fail "固定密码用户已存在: $CLIENT_NAME"
+		printf '%s:%s\n' "$CLIENT_NAME" "$PASSWORD_VALUE" >>"$PASSWORD_FILE"
+		printf '%s\n' "$CLIENT_NAME" >>"$PASSWORD_USERS_FILE"
+		secure_file "$PASSWORD_USERS_FILE"
+		secure_file "$PASSWORD_FILE"
+	} 201>"$LOCAL_PATH/auth/.static-password.lock"
 	log_success "固定密码用户添加完成: $CLIENT_NAME"
 }
 
 # 删除用户的固定密码认证凭据。
 delete_password_user() {
 	normalize_user "$USER_INPUT"
-	grep -Fxq "$CLIENT_NAME" "$PASSWORD_USERS_FILE" || fail "固定密码用户不存在: $CLIENT_NAME"
 	log_start "删除固定密码用户: ${CLIENT_NAME}（环境: ${ENV_NAME}）"
-	exec 201>"$LOCAL_PATH/auth/.static-password.lock"
-	flock -w 10 201 || fail "无法锁定固定密码状态文件"
-	remove_password_user "$CLIENT_NAME"
-	flock -u 201
+	{
+		flock -w 10 201 || fail "无法锁定固定密码状态文件"
+		grep -Fxq "$CLIENT_NAME" "$PASSWORD_USERS_FILE" || fail "固定密码用户不存在: $CLIENT_NAME"
+		remove_password_user_unlocked "$CLIENT_NAME"
+	} 201>"$LOCAL_PATH/auth/.static-password.lock"
 	log_success "固定密码用户删除完成: $CLIENT_NAME"
 }
 
 # 原子更新固定密码用户的密码。
 change_password_user() {
 	normalize_user "$USER_INPUT"
-	grep -Fxq "$CLIENT_NAME" "$PASSWORD_USERS_FILE" || fail "固定密码用户不存在: $CLIENT_NAME"
 	log_start "修改固定密码用户密码: ${CLIENT_NAME}（环境: ${ENV_NAME}）"
 	read_password
-	exec 201>"$LOCAL_PATH/auth/.static-password.lock"
-	flock -w 10 201 || fail "无法锁定固定密码状态文件"
-	temp=$(mktemp "${PASSWORD_FILE}.XXXXXX")
-	awk -F: -v user="$CLIENT_NAME" -v password="$PASSWORD_VALUE" \
-		'$1 == user { print user ":" password; updated = 1; next } { print } END { if (!updated) print user ":" password }' \
-		"$PASSWORD_FILE" >"$temp"
-	mv "$temp" "$PASSWORD_FILE"
-	secure_file "$PASSWORD_FILE"
-	flock -u 201
+	{
+		flock -w 10 201 || fail "无法锁定固定密码状态文件"
+		grep -Fxq "$CLIENT_NAME" "$PASSWORD_USERS_FILE" || fail "固定密码用户不存在: $CLIENT_NAME"
+		temp=$(mktemp "${PASSWORD_FILE}.XXXXXX")
+		awk -F: -v user="$CLIENT_NAME" -v password="$PASSWORD_VALUE" \
+			'$1 == user { print user ":" password; updated = 1; next } { print } END { if (!updated) print user ":" password }' \
+			"$PASSWORD_FILE" >"$temp"
+		mv "$temp" "$PASSWORD_FILE"
+		secure_file "$PASSWORD_FILE"
+	} 201>"$LOCAL_PATH/auth/.static-password.lock"
 	log_success "固定密码修改完成: $CLIENT_NAME"
 }
 
 # 列出固定密码用户名且不暴露密码内容。
 list_password_users() {
 	log_info "列出环境 $ENV_NAME 的固定密码用户（不显示密码）"
-	secure_file "$PASSWORD_USERS_FILE"
-	sort -u "$PASSWORD_USERS_FILE"
+	{
+		flock -w 10 201 || fail "无法锁定固定密码状态文件"
+		secure_file "$PASSWORD_USERS_FILE"
+		sort -u "$PASSWORD_USERS_FILE"
+	} 201>"$LOCAL_PATH/auth/.static-password.lock"
 }
 
 # 校验并规范化路由，生成 CIDR、掩码和 CCD 配置行。
@@ -634,8 +661,7 @@ apply_route() {
 	if ! docker exec "$CONTAINER_NAME" ovpn_firewall update-routes \
 		"$action" "$CLIENT_NAME" "$ROUTE_CIDR"; then
 		mv "$backup" "$CLIENT_CCD"
-		docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
-			"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd" >/dev/null 2>&1 || true
+		sync_user_access_rules "$CLIENT_NAME" >/dev/null 2>&1 || true
 		fail "运行时路由更新失败，CCD 已回滚: $CLIENT_NAME -> $ROUTE_CIDR"
 	fi
 	rm -f "$backup"
@@ -821,8 +847,9 @@ add_domain_routes() {
 			cp -p "$backup_dir/$target" "$CCD_DIR/$target"
 		done
 		rm -r "$backup_dir"
-		docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
-			"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd" >/dev/null 2>&1 || true
+		for target in "${target_users[@]}"; do
+			sync_user_access_rules "$target" >/dev/null 2>&1 || true
+		done
 		fail "运行时域名路由更新失败，CCD 已回滚"
 	fi
 	rm -r "$backup_dir"
@@ -876,8 +903,9 @@ route_all() {
 			cp -p "$backup_dir/$user" "$CCD_DIR/$user"
 		done
 		rm -r "$backup_dir"
-		docker exec "$CONTAINER_NAME" ovpn_firewall sync-rules \
-			"$OPENVPN/state/client-ips.csv" "$OPENVPN/ccd" >/dev/null 2>&1 || true
+		for user in "${users[@]}"; do
+			sync_user_access_rules "$user" >/dev/null 2>&1 || true
+		done
 		fail "运行时批量路由更新失败，CCD 已回滚"
 	fi
 	rm -r "$backup_dir"
@@ -905,15 +933,18 @@ list_hardware() {
 # 清空用户设备绑定字段，使其可在下次连接时重新绑定。
 delete_hardware() {
 	normalize_user "$USER_INPUT"
-	if ! awk -F', ' -v user="$CLIENT_NAME" '$1 == user { found = 1 } END { exit found ? 0 : 1 }' "$CLIENT_DB"; then
-		fail "找不到用户状态记录: $CLIENT_NAME"
-	fi
 	log_start "清空用户设备绑定: ${CLIENT_NAME}（环境: ${ENV_NAME}）"
-	temp=$(mktemp "${CLIENT_DB}.XXXXXX")
-	awk -F', ' -v OFS=', ' -v user="$CLIENT_NAME" \
-		'$1 == user { $3=""; $4=""; $5=""; $6=""; $7="" } { print }' "$CLIENT_DB" >"$temp"
-	mv "$temp" "$CLIENT_DB"
-	chown 65534:65534 "$CLIENT_DB" 2>/dev/null || true
+	{
+		flock -w 10 200 || fail "无法锁定客户端 IP 状态文件"
+		if ! awk -F', ' -v user="$CLIENT_NAME" '$1 == user { found = 1 } END { exit found ? 0 : 1 }' "$CLIENT_DB"; then
+			fail "找不到用户状态记录: $CLIENT_NAME"
+		fi
+		temp=$(mktemp "${CLIENT_DB}.XXXXXX")
+		awk -F', ' -v OFS=', ' -v user="$CLIENT_NAME" \
+			'$1 == user { $3=""; $4=""; $5=""; $6=""; $7="" } { print }' "$CLIENT_DB" >"$temp"
+		mv "$temp" "$CLIENT_DB"
+		chown 65534:65534 "$CLIENT_DB" 2>/dev/null || true
+	} 200>"$LOCAL_PATH/state/.client-ip.lock"
 	log_success "设备绑定已清空: $CLIENT_NAME"
 	list_hardware
 }
