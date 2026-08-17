@@ -11,13 +11,13 @@ bash helpers/run-client.sh /etc/openvpn/client production.ovpn
 bash helpers/run-client.sh /etc/openvpn/client production.ovpn alice 'password-or-otp'
 ```
 
-参数依次为配置目录、配置文件名，以及可选的用户名和密码。用户名与密码必须同时提供；提供后脚本会在配置目录创建 `<user>-pass`，并通过 `--auth-user-pass` 交给 OpenVPN。日志写入配置目录中的 `<user>_<YYYYMMDD>.log`。
+参数依次为配置目录、配置文件名，以及可选的用户名和密码。用户名与密码必须同时提供；提供后脚本会在配置目录创建隐藏的 `.<config-name>.auth`，设置为 `0600`，并通过 `--auth-user-pass` 交给 OpenVPN。日志写入配置目录中的 `<user>_<YYYYMMDD>.log`；未提供用户时使用 `<config-name>_<YYYYMMDD>.log`。用户名中的文件名不安全字符会替换为 `_`，日志不会写出配置目录。
 
-执行前，脚本会查找命令行中匹配配置目录名的现有进程并发送 `SIGKILL`。匹配不是基于 OpenVPN PID 文件，可能命中无关进程；仅应在进程范围可控的专用客户端上使用。
+脚本通过 `.<config-name>.pid` 管理该配置启动的 OpenVPN 进程。再次执行时只处理 PID 文件指向且命令行同时匹配当前配置目录和配置文件名的进程，先发送 `SIGTERM`，等待 5 秒后仍未退出才发送 `SIGKILL`；陈旧 PID 文件会自动清理。
 
-认证文件包含明文用户名和密码，脚本不会自动删除或设置专用权限。使用带认证参数的模式前，应收紧目录权限；连接完成后由管理员安全删除该文件。密码作为命令行参数还可能进入 Shell 历史，因此不适合直接处理长期凭据。
+认证文件仍包含明文用户名和密码，脚本不会自动删除。连接完成后由管理员安全删除；密码作为命令行参数还可能进入 Shell 历史，因此不适合直接处理长期凭据。
 
-运行要求：Bash、OpenVPN、`pgrep`、`grep`、`awk` 和 `tail`。
+运行要求：Bash、OpenVPN、Linux `/proc` 和 `tail`。
 
 ## 安装 systemd 服务
 

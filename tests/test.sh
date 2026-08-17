@@ -161,11 +161,16 @@ template_last_byte=$(tail -c 1 "$PROJECT_ROOT/deploy/templates/ccd/default" | od
 
 echo "+ Shared connection state update"
 connection_runtime="$TEST_ROOT/connection-runtime"
-mkdir -p "$connection_runtime/state"
+connection_bin="$TEST_ROOT/connection-bin"
+mkdir -p "$connection_runtime/state" "$connection_runtime/logs" "$connection_bin"
 printf '%s\n' \
 	'alice-test, 10.8.0.2, , , , , , 1' \
 	'alice.test, 10.8.0.3, , , , , , 2' \
 	>"$connection_runtime/state/client-ips.csv"
+cat >"$connection_runtime/ovpn.env" <<EOF
+LOG_PATH="$connection_runtime/logs"
+OVPN_HOOKS_PATH="$PROJECT_ROOT/deploy/hooks"
+EOF
 (
 	export OPENVPN="$connection_runtime"
 	# shellcheck source=/dev/null
@@ -178,6 +183,48 @@ updated_login=$(awk -F', ' '$1 == "alice.test" { print $8 }' \
 	"$connection_runtime/state/client-ips.csv")
 [[ $updated_login =~ ^[0-9]+$ && $updated_login != 2 ]]
 
+cat >"$connection_bin/flock" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$connection_bin/flock"
+if OPENVPN="$connection_runtime" common_name=alice-test trusted_ip=192.0.2.10 \
+	PATH="$connection_bin:$PATH" bash "$PROJECT_ROOT/deploy/hooks/client-connect-basic.sh" \
+	>/dev/null 2>&1; then
+	echo "basic connection hook ignored a client state lock failure" >&2
+	exit 1
+fi
+[[ $(awk -F', ' '$1 == "alice-test" { print $8 }' \
+	"$connection_runtime/state/client-ips.csv") == 1 ]]
+
+echo "+ Device trust-on-first-use and successful login timestamps"
+device_runtime="$TEST_ROOT/device-runtime"
+mkdir -p "$device_runtime/state" "$device_runtime/logs"
+cat >"$device_runtime/ovpn.env" <<EOF
+LOG_PATH="$device_runtime/logs"
+OVPN_HOOKS_PATH="$PROJECT_ROOT/deploy/hooks"
+EOF
+printf 'alice, 10.8.0.2, , , , , , 1\n' >"$device_runtime/state/client-ips.csv"
+: >"$device_runtime/state/client-ip-history.csv"
+OPENVPN="$device_runtime" common_name=alice ifconfig_pool_remote_ip=10.8.0.2 \
+	trusted_ip=192.0.2.11 IV_PLAT=linux IV_PLAT_VER=1 IV_GUI_VER=Signed \
+	IV_USER=alice IV_INFO=device IV_CPU=generic IV_DISK= \
+	bash "$PROJECT_ROOT/deploy/hooks/client-connect-device.sh" >/dev/null
+[[ $(awk -F', ' '$1 == "alice" { print $3, $6, $7 }' \
+	"$device_runtime/state/client-ips.csv") == 'linux device ' ]]
+
+printf 'alice, 10.8.0.2, win, 1, alice, device, disk, 1\n' \
+	>"$device_runtime/state/client-ips.csv"
+if OPENVPN="$device_runtime" common_name=alice ifconfig_pool_remote_ip=10.8.0.2 \
+	trusted_ip=192.0.2.11 IV_PLAT=linux IV_PLAT_VER=1 IV_GUI_VER=Signed \
+	IV_USER=alice IV_INFO=device IV_CPU=generic IV_DISK=disk \
+	bash "$PROJECT_ROOT/deploy/hooks/client-connect-device.sh" >/dev/null 2>&1; then
+	echo "mismatched device unexpectedly passed validation" >&2
+	exit 1
+fi
+[[ $(awk -F', ' '$1 == "alice" { print $8 }' \
+	"$device_runtime/state/client-ips.csv") == 1 ]]
+
 echo "+ LDAP connection state and firewall retry"
 ldap_runtime="$TEST_ROOT/ldap-connection-runtime"
 ldap_bin="$TEST_ROOT/ldap-connection-bin"
@@ -186,6 +233,7 @@ mkdir -p "$ldap_runtime/ccd" "$ldap_runtime/logs" "$ldap_runtime/state" "$ldap_b
 cat >"$ldap_runtime/ovpn.env" <<EOF
 LOG_PATH="$ldap_runtime/logs"
 IPTABLES_POLICY=true
+OVPN_HOOKS_PATH="$PROJECT_ROOT/deploy/hooks"
 EOF
 cat >"$ldap_bin/ovpn_firewall" <<'EOF'
 #!/bin/bash
@@ -208,6 +256,9 @@ if OPENVPN="$ldap_runtime" LOG_PATH="$ldap_runtime/logs" IPTABLES_POLICY=true \
 	exit 1
 fi
 grep -Fq 'ldap-user, 10.8.0.20' "$ldap_runtime/state/client-ips.csv"
+awk -F', ' -v OFS=', ' '$1 == "ldap-user" { $8 = 1 } { print }' \
+	"$ldap_runtime/state/client-ips.csv" >"$ldap_runtime/state/client-ips.csv.tmp"
+mv "$ldap_runtime/state/client-ips.csv.tmp" "$ldap_runtime/state/client-ips.csv"
 OPENVPN="$ldap_runtime" LOG_PATH="$ldap_runtime/logs" IPTABLES_POLICY=true \
 	LDAP_FIREWALL_LOG="$ldap_firewall_log" \
 	common_name=ldap-user ifconfig_pool_remote_ip=10.8.0.21 \
@@ -215,6 +266,9 @@ OPENVPN="$ldap_runtime" LOG_PATH="$ldap_runtime/logs" IPTABLES_POLICY=true \
 	PATH="$ldap_bin:$PATH" bash "$PROJECT_ROOT/deploy/hooks/client-connect-ldap.sh" >/dev/null
 [[ $(grep -Fc 'ensure-user ldap-user 10.8.0.20' "$ldap_firewall_log") -eq 2 ]]
 [[ $(grep -Fc 'ldap-user, 10.8.0.20' "$ldap_runtime/state/client-ips.csv") -eq 1 ]]
+ldap_last_login=$(awk -F', ' '$1 == "ldap-user" { print $8 }' \
+	"$ldap_runtime/state/client-ips.csv")
+[[ $ldap_last_login =~ ^[0-9]+$ && $ldap_last_login != 1 ]]
 
 echo "+ Adaptive iptables backend selection"
 firewall_root="$TEST_ROOT/firewall"
@@ -611,6 +665,16 @@ chmod +x "$client_bin/openssl"
 client_config=$(OPENVPN="$client_runtime" PATH="$client_bin:$PATH" \
 	bash "$PROJECT_ROOT/server/bin/ovpn_getclient" alice combined)
 [[ $(grep -Fxc 'push-peer-info' <<<"$client_config") -eq 1 ]]
+mkdir -p "$client_runtime/clients/alice"
+chmod 755 "$client_runtime/clients/alice"
+client_profile_date=$(date +%Y%m%d)
+printf 'legacy profile\n' >"$client_runtime/clients/alice/alice-$client_profile_date.ovpn"
+chmod 644 "$client_runtime/clients/alice/alice-$client_profile_date.ovpn"
+OPENVPN="$client_runtime" PATH="$client_bin:$PATH" \
+	bash "$PROJECT_ROOT/server/bin/ovpn_getclient" alice combined-save
+client_profile=$(find "$client_runtime/clients/alice" -maxdepth 1 -type f -name '*.ovpn' -print -quit)
+[[ $(stat -c '%a' "$client_profile") == 600 ]]
+[[ $(stat -c '%a' "$client_runtime/clients/alice") == 700 ]]
 
 make_env() {
 	local target=$1 ldap=$2 otp=$3 password_auth=$4
@@ -667,12 +731,21 @@ fi
 echo "+ Shell-native fixed password management"
 password_runtime="$TEST_ROOT/openvpn-test"
 mkdir -p "$TEST_ROOT/bin"
-printf '#!/bin/sh\nexit 0\n' >"$TEST_ROOT/bin/flock"
+printf '#!/bin/sh\nexec /usr/bin/flock "$@"\n' >"$TEST_ROOT/bin/flock"
 chmod +x "$TEST_ROOT/bin/flock"
 cat >"$TEST_ROOT/bin/docker" <<'EOF'
 #!/bin/sh
 if [ "${MOCK_DOCKER_FAIL:-0}" = 1 ]; then
     exit 23
+fi
+if [ "${1:-}" = exec ] && [ -n "${MOCK_DOCKER_SERIAL_DIR:-}" ]; then
+    if mkdir "$MOCK_DOCKER_SERIAL_DIR/active" 2>/dev/null; then
+        sleep 1
+        rmdir "$MOCK_DOCKER_SERIAL_DIR/active"
+    else
+        touch "$MOCK_DOCKER_SERIAL_DIR/overlap"
+    fi
+    exit 0
 fi
 if [ "${1:-}" = inspect ]; then
     printf 'true\n'
@@ -893,6 +966,23 @@ grep -Fq '| 为用户 alice-test 添加路由: 10.30.0.0/16' "$service_log"
 grep -Fq '* 路由添加完成: alice-test -> 10.30.0.0/16' "$service_log"
 grep -Fxq 'push "route 10.30.0.0 255.255.0.0"' "$password_runtime/ccd/alice-test"
 
+echo "+ Serialized CCD route updates"
+serial_dir="$TEST_ROOT/route-serialization"
+mkdir -p "$serial_dir"
+MOCK_DOCKER_SERIAL_DIR="$serial_dir" OVPN_RUNTIME_ROOT="$TEST_ROOT" \
+	bash "$PROJECT_ROOT/deploy/ovpn" addroute test alice 10.31.0.0/16 \
+	>/dev/null 2>&1 &
+route_pid_one=$!
+MOCK_DOCKER_SERIAL_DIR="$serial_dir" OVPN_RUNTIME_ROOT="$TEST_ROOT" \
+	bash "$PROJECT_ROOT/deploy/ovpn" addroute test alice 10.32.0.0/16 \
+	>/dev/null 2>&1 &
+route_pid_two=$!
+wait "$route_pid_one"
+wait "$route_pid_two"
+[[ ! -e $serial_dir/overlap ]]
+grep -Fxq 'push "route 10.31.0.0 255.255.0.0"' "$password_runtime/ccd/alice-test"
+grep -Fxq 'push "route 10.32.0.0 255.255.0.0"' "$password_runtime/ccd/alice-test"
+
 echo "+ Domain route integration"
 domain_file="$TEST_ROOT/domains.txt"
 cat >"$domain_file" <<'EOF'
@@ -969,6 +1059,169 @@ if ! grep -Fq -- '- 域名文件中没有可添加的 IPv4 路由（解析失败
 	cat "$domain_log" >&2
 	exit 1
 fi
+
+echo "+ Client helper PID and credential management"
+client_helper_root="$TEST_ROOT/client-helper"
+client_helper_bin="$client_helper_root/bin"
+client_helper_config="$client_helper_root/config"
+client_helper_other_config="$client_helper_root/other-config"
+client_helper_args="$client_helper_root/openvpn.args"
+client_helper_error="$client_helper_root/run-client.error"
+real_openvpn=$(command -v openvpn)
+mkdir -p "$client_helper_bin" "$client_helper_config" "$client_helper_other_config"
+touch "$client_helper_config/production.ovpn" \
+	"$client_helper_other_config/production.ovpn" \
+	"$client_helper_other_config/other.ovpn"
+cat >"$client_helper_bin/openvpn" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >"$CLIENT_HELPER_ARGS"
+config_dir=""
+log_name=""
+pid_path=""
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --cd) config_dir=$2; shift 2 ;;
+        --log-append) log_name=$2; shift 2 ;;
+        --writepid) pid_path=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf '%s\n' "$$" >"$pid_path"
+: >"$config_dir/$log_name"
+EOF
+chmod +x "$client_helper_bin/openvpn"
+CLIENT_HELPER_ARGS="$client_helper_args" PATH="$client_helper_bin:$PATH" \
+	bash "$PROJECT_ROOT/deploy/helpers/run-client.sh" \
+	"$client_helper_config" production.ovpn alice test-password >/dev/null
+grep -Fxq -- '--writepid' "$client_helper_args"
+grep -Fxq -- '--auth-user-pass' "$client_helper_args"
+[[ $(stat -c '%a' "$client_helper_config/.production.auth") == 600 ]]
+grep -Fxq 'alice' "$client_helper_config/.production.auth"
+grep -Fxq 'test-password' "$client_helper_config/.production.auth"
+
+rm -f "$client_helper_config/.production.pid"
+CLIENT_HELPER_ARGS="$client_helper_args" PATH="$client_helper_bin:$PATH" \
+	bash "$PROJECT_ROOT/deploy/helpers/run-client.sh" \
+	"$client_helper_config" production.ovpn '../escaped' test-password >/dev/null
+escaped_log_name=".._escaped_$(date +%Y%m%d).log"
+grep -Fxq "$escaped_log_name" "$client_helper_args"
+[[ -f $client_helper_config/$escaped_log_name ]]
+if find "$client_helper_root" -maxdepth 1 -name 'escaped_*.log' | grep -q .; then
+	echo "client helper allowed a log path to escape the configuration directory" >&2
+	exit 1
+fi
+
+start_client_helper_openvpn() {
+	local config_dir=$1 config_name=$2 launch_pid_path
+	launch_pid_path="$client_helper_root/launch-$RANDOM.pid"
+	"$real_openvpn" --daemon --writepid "$launch_pid_path" \
+		--cd "$config_dir" --config "$config_name" \
+		--dev null --remote 127.0.0.1 1 --proto udp \
+		--ifconfig-noexec --route-noexec --verb 0 \
+		--allow-deprecated-insecure-static-crypto
+	for _ in {1..5}; do
+		if [[ -s $launch_pid_path ]]; then
+			read -r client_helper_openvpn_pid <"$launch_pid_path"
+			kill -0 "$client_helper_openvpn_pid" 2>/dev/null && return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
+start_client_helper_openvpn "$client_helper_other_config" other.ovpn
+printf '%s\n' "$client_helper_openvpn_pid" >"$client_helper_config/.production.pid"
+if CLIENT_HELPER_ARGS="$client_helper_args" PATH="$client_helper_bin:$PATH" \
+	bash "$PROJECT_ROOT/deploy/helpers/run-client.sh" \
+	"$client_helper_config" production.ovpn >/dev/null 2>"$client_helper_error"; then
+	echo "client helper stopped an OpenVPN process for a different configuration" >&2
+	exit 1
+fi
+kill -0 "$client_helper_openvpn_pid"
+kill "$client_helper_openvpn_pid"
+
+start_client_helper_openvpn "$client_helper_other_config" production.ovpn
+printf '%s\n' "$client_helper_openvpn_pid" >"$client_helper_config/.production.pid"
+if CLIENT_HELPER_ARGS="$client_helper_args" PATH="$client_helper_bin:$PATH" \
+	bash "$PROJECT_ROOT/deploy/helpers/run-client.sh" \
+	"$client_helper_config" production.ovpn >/dev/null 2>"$client_helper_error"; then
+	echo "client helper stopped an OpenVPN process from another configuration directory" >&2
+	exit 1
+fi
+grep -Fq 'different OpenVPN configuration directory' "$client_helper_error"
+kill -0 "$client_helper_openvpn_pid"
+kill "$client_helper_openvpn_pid"
+
+start_client_helper_openvpn "$client_helper_config" production.ovpn
+matching_client_pid=$client_helper_openvpn_pid
+printf '%s\n' "$matching_client_pid" >"$client_helper_config/.production.pid"
+CLIENT_HELPER_ARGS="$client_helper_args" PATH="$client_helper_bin:$PATH" \
+	bash "$PROJECT_ROOT/deploy/helpers/run-client.sh" \
+	"$client_helper_config" production.ovpn >/dev/null
+if kill -0 "$matching_client_pid" 2>/dev/null; then
+	echo "client helper did not stop its matching OpenVPN process" >&2
+	exit 1
+fi
+if grep -Eq 'pgrep|kill -9.*pids' "$PROJECT_ROOT/deploy/helpers/run-client.sh"; then
+	echo "client helper still scans unrelated processes" >&2
+	exit 1
+fi
+
+echo "+ Installer-managed cron convergence"
+install_bin="$TEST_ROOT/install-bin"
+install_env_name="repo-audit-$$"
+install_runtime="/opt/openvpn-$install_env_name"
+install_cron="$TEST_ROOT/install.cron"
+install_stderr="$TEST_ROOT/install.stderr"
+mkdir -p "$install_bin"
+cat >"$install_bin/docker" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat >"$install_bin/crontab" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = -l ]; then
+    cat "$INSTALL_CRON_SOURCE"
+else
+    cat >"$INSTALL_CRON_CAPTURE"
+fi
+EOF
+cat >"$install_bin/iptables-save" <<'EOF'
+#!/bin/sh
+printf '*filter\nCOMMIT\n'
+EOF
+cp "$install_bin/iptables-save" "$install_bin/ip6tables-save"
+chmod +x "$install_bin"/*
+cat >"$TEST_ROOT/install.cron.source" <<EOF
+5 4 * * * /usr/local/bin/unrelated-task
+0 0 * * * $install_runtime/maintenance/rotate-logs.sh
+15 0 * * * $install_runtime/maintenance/revoke-inactive-clients.sh
+EOF
+sed -e 's/^OTP=.*/OTP=false/' -e 's/^AUTO_REVOKE=.*/AUTO_REVOKE=false/' \
+	"$PROJECT_ROOT/deploy/ovpn.env.example" >"$TEST_ROOT/install.env"
+INSTALL_CRON_SOURCE="$TEST_ROOT/install.cron.source" \
+	INSTALL_CRON_CAPTURE="$install_cron" PATH="$install_bin:$PATH" \
+	bash "$PROJECT_ROOT/deploy/install.sh" "$install_env_name" "$TEST_ROOT/install.env" \
+	>/dev/null 2>"$install_stderr"
+grep -Fxq '5 4 * * * /usr/local/bin/unrelated-task' "$install_cron"
+[[ $(grep -Fc "$install_runtime/maintenance/rotate-logs.sh" "$install_cron") -eq 1 ]]
+if grep -Fq "$install_runtime/maintenance/revoke-inactive-clients.sh" "$install_cron"; then
+	echo "disabled automatic revocation remained in root crontab" >&2
+	exit 1
+fi
+rm -rf "$install_runtime"
+
+sed -e 's/^OTP=.*/OTP=false/' -e 's/^LDAP=.*/LDAP=true/' \
+	-e 's/^AUTO_REVOKE=.*/AUTO_REVOKE=true/' \
+	"$PROJECT_ROOT/deploy/ovpn.env.example" >"$TEST_ROOT/install-ldap.env"
+if INSTALL_CRON_SOURCE="$TEST_ROOT/install.cron.source" \
+	INSTALL_CRON_CAPTURE="$install_cron" PATH="$install_bin:$PATH" \
+	bash "$PROJECT_ROOT/deploy/install.sh" "${install_env_name}-ldap" \
+	"$TEST_ROOT/install-ldap.env" >/dev/null 2>"$install_stderr"; then
+	echo "LDAP and automatic certificate revocation were accepted together" >&2
+	exit 1
+fi
+grep -Fq 'AUTO_REVOKE is only supported for certificate users' "$install_stderr"
 
 echo "+ Deploy package layout"
 cp -R "$PROJECT_ROOT/deploy" "$TEST_ROOT/deploy-package"

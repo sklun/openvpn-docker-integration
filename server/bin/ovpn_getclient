@@ -2,6 +2,7 @@
 # 功能说明：根据客户端证书生成内嵌式或分离式 OpenVPN 客户端配置。
 
 set -eo pipefail
+umask 077
 
 OPENVPN=${OPENVPN:-/etc/openvpn}
 # shellcheck source=/dev/null
@@ -84,14 +85,25 @@ combined)
 	;;
 combined-save)
 	mkdir -p "$output_dir"
-	write_config combined >"$output_dir/$cn-$(date +%Y%m%d).ovpn"
+	chmod 700 "$output_dir"
+	output_file="$output_dir/$cn-$(date +%Y%m%d).ovpn"
+	temp_output=$(mktemp "$output_file.XXXXXX")
+	write_config combined >"$temp_output"
+	chmod 600 "$temp_output"
+	mv "$temp_output" "$output_file"
 	;;
 separated)
 	mkdir -p "$output_dir"
-	write_config separated >"$output_dir/$cn.ovpn"
+	chmod 700 "$output_dir"
+	output_file="$output_dir/$cn.ovpn"
+	temp_output=$(mktemp "$output_file.XXXXXX")
+	write_config separated >"$temp_output"
+	chmod 600 "$temp_output"
+	mv "$temp_output" "$output_file"
 	cp "$EASYRSA_PKI/private/$cn.key" "$output_dir/$cn.key"
 	cp "$EASYRSA_PKI/issued/$cn.crt" "$output_dir/$cn.crt"
 	cp "$EASYRSA_PKI/ca.crt" "$EASYRSA_PKI/ta.key" "$output_dir/"
+	chmod 600 "$output_dir"/*
 	;;
 *)
 	echo "Unknown format: $format" >&2

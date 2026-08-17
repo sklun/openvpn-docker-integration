@@ -153,7 +153,7 @@ ip route replace 10.8.0.0/24 via 172.20.0.2
 
 `OVPN_ROUTES` 由配置生成器写为服务端 `route` 指令，用于 OpenVPN Server 自身的路由表，不会生成客户端 `push`。需要向所有客户端下发目标路由时，可在 `OVPN_PUSH` 中添加 `route ...`，但启用访问策略时仍要同步维护每用户 CCD 白名单。
 
-优先使用 `ovpn addroute*` 维护用户访问，因为这些命令会同时更新 CCD 和运行 ipset。手工编辑 CCD 后必须执行 `ovpn syncrules ENV`；全量同步会先校验全部 CCD，任一非法掩码都会使同步失败并保留原运行规则。
+优先使用 `ovpn addroute*` 维护用户访问，因为这些命令会在客户端状态锁内同时更新 CCD 和运行 ipset，并在失败时恢复 CCD。该锁也覆盖用户删除、固定地址和 LDAP CCD 初始化，避免并发状态变更互相覆盖。手工编辑 CCD 不受锁保护，完成后必须执行 `ovpn syncrules ENV`；全量同步会先校验全部 CCD，任一非法掩码都会使同步失败并保留原运行规则。
 
 ## 宿主机网络策略备份
 

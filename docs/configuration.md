@@ -65,7 +65,7 @@
 | `IPTABLES_POLICY`       | `true`      | 为每个用户建立目标 ipset 白名单，并拒绝未授权的 `tun0` 转发。                                              |
 | `OVPN_IPTABLES_BACKEND` | 空          | 唯一后端状态。为空时自动探测并写回 `nft` 或 `legacy`；已有值且命令可用时直接复用，不可用时重新探测并覆盖。 |
 | `DEVICE_AUTH`           | `false`     | 选择设备绑定连接 Hook。要求客户端通过 peer-info 上报项目约定的扩展字段。LDAP 模式优先使用 LDAP Hook。      |
-| `AUTO_REVOKE`           | `false`     | 安装时是否写入每日自动吊销 crontab。安装后只改此变量不会增删 crontab。                                     |
+| `AUTO_REVOKE`           | `false`     | 安装时是否写入每日证书用户自动吊销 crontab。不能与 `LDAP=true` 同时启用；安装后只改运行时变量不会增删 crontab。 |
 | `AUTO_REVOKE_MONTHS`    | `3`         | 最近登录时间超过 `月数 x 30 天` 的证书用户将被 `ovpn deluser` 删除。                                       |
 
 ## OpenVPN、PKI 与日志
@@ -101,7 +101,7 @@
 | Compose 解析参数      | `OVPN_IMAGE`、`OVPN_PORT`、`OVPN_PROTO`、`OPENVPN`                                              | 需要重建容器；其中协议和挂载点还与已生成配置耦合，生产环境应按新环境部署处理。                                                    |
 | 固化到 `openvpn.conf` | `OVPN_CLIENT_SUBNET`、DNS、全局路由、push、认证模式、LDAP、MTU、密码套件、日志路径、Hook 路径等 | 必须重新运行 `ovpn_gen_server_conf` 并审查结果后重建容器；管理 CLI 没有封装该流程。地址池、认证模式、挂载点等高风险项应新建环境。 |
 | 固化到客户端配置      | `OVPN_HOST`、`OVPN_PORT`、`OVPN_PROTO`、`OVPN_DEFROUTE`、MTU、密码套件、认证开关                | 已有 `.ovpn` 不会改变。需为每个用户执行 `ovpn renewuser ENV USER` 生成新文件，或用容器内批量工具重新导出；旧文件不会自动删除。    |
-| 安装时行为            | `CA_NOPASS`、`AUTO_REVOKE`、`OVPN_CLIENT_SUBNET` 的池边界                                       | 只改运行时文件不会重做初始化或 crontab。人工维护相应状态，或规划重新部署。                                                        |
+| 安装时行为            | `CA_NOPASS`、`AUTO_REVOKE`、`OVPN_CLIENT_SUBNET` 的池边界                                       | 只改运行时文件不会重做初始化或 crontab。重新初始化时安装器会按 `AUTO_REVOKE` 收敛当前环境的受管任务。                              |
 | 维护脚本每次读取      | `AUTO_REVOKE_MONTHS`、`LOG_RETAIN_DAYS`、`LOG_DISK_LIMIT`                                       | 修改后下一次维护任务使用新值；`AUTO_REVOKE` 本身仍由安装时 crontab 决定。                                                         |
 
 `ovpn restart` 只执行运行目录备份、`docker compose down` 和 `up -d`。它会让容器启动脚本重新读取规则相关配置，但不会重新生成 `openvpn.conf`、LDAP 配置、PKI、运行时 Hook 或客户端文件。

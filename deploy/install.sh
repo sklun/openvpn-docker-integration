@@ -100,6 +100,10 @@ validate_config() {
 	true | false) ;;
 	*) fail "OVPN_NAT must be true or false" ;;
 	esac
+	case ${AUTO_REVOKE:-false} in
+	true | false) ;;
+	*) fail "AUTO_REVOKE must be true or false" ;;
+	esac
 	[[ ${OVPN_NATDEVICE:-eth0} =~ ^[a-zA-Z0-9_.:+-]{1,15}$ ]] ||
 		fail "invalid OVPN_NATDEVICE: ${OVPN_NATDEVICE:-}"
 	case ${OVPN_PROTO:-udp} in
@@ -116,6 +120,9 @@ validate_config() {
 
 	if is_true "${LDAP:-false}" && { is_true "${OTP:-false}" || is_true "${PASSWORD_AUTH:-false}"; }; then
 		fail "LDAP cannot be enabled together with OTP or PASSWORD_AUTH"
+	fi
+	if is_true "${LDAP:-false}" && is_true "${AUTO_REVOKE:-false}"; then
+		fail "AUTO_REVOKE is only supported for certificate users and cannot be enabled with LDAP"
 	fi
 	if { is_true "${OTP:-false}" || is_true "${PASSWORD_AUTH:-false}"; } && [[ $OPENVPN != /etc/openvpn ]]; then
 		fail "OPENVPN must be /etc/openvpn when OTP or PASSWORD_AUTH is enabled"
@@ -215,13 +222,15 @@ generate_server() {
 install_maintenance() {
 	install -m 755 "$SCRIPT_DIR/ovpn" /usr/local/bin/ovpn
 
-	local existing
+	local existing rotate_script revoke_script
+	rotate_script="$OVPN_LOCAL_PATH/maintenance/rotate-logs.sh"
+	revoke_script="$OVPN_LOCAL_PATH/maintenance/revoke-inactive-clients.sh"
 	existing=$(crontab -l 2>/dev/null || true)
-	if ! grep -Fq "$OVPN_LOCAL_PATH/maintenance/rotate-logs.sh" <<<"$existing"; then
-		existing+=$'\n'"0 0 * * * $OVPN_LOCAL_PATH/maintenance/rotate-logs.sh"
-	fi
-	if is_true "${AUTO_REVOKE:-false}" && ! grep -Fq "$OVPN_LOCAL_PATH/maintenance/revoke-inactive-clients.sh" <<<"$existing"; then
-		existing+=$'\n'"15 0 * * * $OVPN_LOCAL_PATH/maintenance/revoke-inactive-clients.sh"
+	existing=$(awk -v rotate_script="$rotate_script" -v revoke_script="$revoke_script" \
+		'index($0, rotate_script) == 0 && index($0, revoke_script) == 0' <<<"$existing")
+	existing+=$'\n'"0 0 * * * $rotate_script"
+	if is_true "${AUTO_REVOKE:-false}"; then
+		existing+=$'\n'"15 0 * * * $revoke_script"
 	fi
 	printf '%s\n' "$existing" | awk 'NF' | crontab -
 }

@@ -52,7 +52,7 @@ ${log_date} [DEV_AUTH] ${user_cip} SYSTEM USER:=${IV_USER}\n\
 ${log_date} [DEV_AUTH] ${user_cip} DEVICE UUID/SN:=${IV_INFO}\n\
 ${log_date} [DEV_AUTH] ${user_cip} DISK UUID:=${IV_DISK}" |
 			column -s '=' -t
-		# shellcheck disable=SC2154  # Set by update_login_time in connection-state.sh.
+		login_time=$(date +%s)
 		add_info="${user_cip}, ${IV_PLAT}, ${IV_PLAT_VER}, ${IV_USER}, ${IV_INFO}, ${IV_DISK}, ${login_time}"
 		temp=$(mktemp "${db_path}.XXXXXX")
 		while IFS= read -r line; do
@@ -136,6 +136,7 @@ main() {
 				fi
 				check_items "$IV_DISK" "7" "DISK UUID"
 			fi
+			update_login_time_unlocked "$common_name" "$db_path"
 			echo -e "${log_date} [DEV_AUTH] [ACCESS] USER ${user_cip} from $trusted_ip LOGGED IN\n" | tee -a "${log_path}"
 			exit 0
 			;;
@@ -153,6 +154,7 @@ main() {
 			check_info
 			check_items "$IV_PLAT" "3" "SYSTEM PLAT"
 			check_items "$IV_INFO" "6" "DEVICE UUID"
+			update_login_time_unlocked "$common_name" "$db_path"
 			echo -e "${log_date} [DEV_AUTH] [ACCESS] USER ${user_cip} from $trusted_ip LOGGED IN\n" | tee -a "${log_path}"
 			exit 0
 			;;
@@ -171,6 +173,5 @@ main() {
 		exit 1
 	}
 	check_user
-	update_login_time_unlocked "$common_name" "$db_path"
 	main
 } 200>"$OPENVPN/state/.client-ip.lock"

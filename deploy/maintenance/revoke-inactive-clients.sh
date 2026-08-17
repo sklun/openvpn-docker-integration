@@ -8,6 +8,11 @@ env_name=${local_path##*/openvpn-}
 # shellcheck source=/dev/null
 source "$local_path/ovpn.env"
 
+if [[ ${LDAP:-false} == true ]]; then
+	echo "Skip inactive certificate revocation: LDAP environments are not supported" >&2
+	exit 0
+fi
+
 db_path="$local_path/state/client-ips.csv"
 log_path="$local_path/logs/revoke.log"
 max_months=${AUTO_REVOKE_MONTHS:-3}

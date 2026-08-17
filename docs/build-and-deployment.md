@@ -72,7 +72,7 @@ bash install.sh production ./ovpn.env
 4. 创建 `auth/`、`ccd/`、`clients/`、`hooks/`、`logs/`、`maintenance/`、`otp/`、`state/` 等运行目录，复制配置、Hook、维护脚本和 Compose 模板。
 5. 把源配置复制为运行时 `ovpn.env`，写入计算得到的 `SUBNET_IP_FIRST`、`SUBNET_IP_LAST` 和 `OVPN_HOOKS_PATH`。源文件不会被修改。
 6. 使用一次性容器生成 `openvpn.conf`，初始化 CA、服务端证书、DH、`ta.key` 和 CRL。
-7. 安装 `/usr/local/bin/ovpn`，写入日志轮转及可选的自动吊销 crontab。
+7. 安装 `/usr/local/bin/ovpn`，按当前配置收敛该环境的日志轮转及可选自动吊销 crontab。
 8. 将运行目录交给容器内 `nobody` 用户，启动 Compose 服务，随后备份宿主机当前 iptables/ip6tables 策略。
 
 运行时结构见 [运维与管理命令](operations.md)。

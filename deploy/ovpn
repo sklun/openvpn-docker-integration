@@ -2,6 +2,7 @@
 # 功能说明：提供 OpenVPN 环境、证书用户、密码、路由和运行状态的统一管理命令入口。
 
 set -Eeuo pipefail
+umask 077
 
 COMMAND=${1:-help}
 ENV_NAME=${2:-}
@@ -166,6 +167,12 @@ require_running() {
 	container_running || fail "容器未运行: $CONTAINER_NAME"
 }
 
+# 锁定客户端地址、CCD 和设备绑定共用的状态边界。
+lock_client_state() {
+	exec 202>"$LOCAL_PATH/state/.client-ip.lock"
+	flock -w 30 202 || fail "无法锁定客户端状态"
+}
+
 # 校验字符串是否为合法 IPv4 地址。
 valid_ipv4() {
 	local ip=$1 octet
@@ -292,6 +299,10 @@ secure_file() {
 set_runtime_ownership() {
 	local otp_file
 	chown -R 65534:65534 "$LOCAL_PATH"
+	if [[ -d $LOCAL_PATH/clients ]]; then
+		find "$LOCAL_PATH/clients" -type d -exec chmod 700 {} +
+		find "$LOCAL_PATH/clients" -type f -exec chmod 600 {} +
+	fi
 	for otp_file in "$LOCAL_PATH"/otp/*.google_authenticator; do
 		[[ -e $otp_file ]] || continue
 		chown 0:0 "$otp_file"
@@ -428,6 +439,7 @@ create_user() {
 		mkdir -p "$CLIENT_OUTPUT"
 		docker run --rm -i -v "$LOCAL_PATH:$OPENVPN" -e "OPENVPN=$OPENVPN" \
 			"$OVPN_IMAGE" ovpn_otp_user "$CLIENT_NAME" | tee "$CLIENT_OUTPUT/$CLIENT_NAME-otpinfo"
+		chmod 600 "$CLIENT_OUTPUT/$CLIENT_NAME-otpinfo"
 	fi
 
 	log_info "分配固定 IP 并写入访问规则"
@@ -648,6 +660,7 @@ apply_route() {
 	local action=$1 action_name backup
 	require_running
 	normalize_user "$USER_INPUT"
+	lock_client_state
 	[[ -f $CLIENT_CCD ]] || fail "找不到用户 CCD: $CLIENT_NAME"
 	backup=$(mktemp "${CLIENT_CCD}.XXXXXX")
 	cp -p "$CLIENT_CCD" "$backup"
@@ -832,6 +845,7 @@ add_domain_routes() {
 		esac
 	fi
 
+	lock_client_state
 	backup_dir=$(mktemp -d "$LOCAL_PATH/state/ccd-routes.XXXXXX")
 	for target in "${target_users[@]}"; do
 		cp -p "$CCD_DIR/$target" "$backup_dir/$target"
@@ -878,6 +892,7 @@ route_all() {
 	local -a users=() route_updates=()
 	normalize_route "$USER_INPUT"
 	require_running
+	lock_client_state
 	if [[ $action == add ]]; then action_name=添加; else action_name=删除; fi
 	log_start "为环境 $ENV_NAME 的全部用户${action_name}路由: $ROUTE_CIDR"
 	for ccd in "$CCD_DIR"/*; do

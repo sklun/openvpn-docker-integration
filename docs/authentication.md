@@ -47,7 +47,7 @@ ovpn listuser production
 - `deluser` 吊销证书、更新 CRL、删除私钥/证书/请求、客户端目录、CCD、当前 IP 映射和固定密码，并在容器运行时只删除该用户的规则和 ipset。
 - 历史 IP 文件不会因删除用户而清理，可用于审计。
 
-客户端配置包含私钥、证书、CA 和 TLS Auth 密钥，必须按凭据保护。启用任一用户名密码认证时，生成器还会写入 `auth-user-pass`、`auth-nocache` 和 `reneg-sec 0`。
+客户端配置包含私钥、证书、CA 和 TLS Auth 密钥，必须按凭据保护。`clients/<user>/` 目录固定为 `0700`，其中 `.ovpn`、分离式证书材料和 OTP 交付文件固定为 `0600`。启用任一用户名密码认证时，生成器还会写入 `auth-user-pass`、`auth-nocache` 和 `reneg-sec 0`。
 
 ## OTP
 
@@ -57,7 +57,7 @@ ovpn listuser production
 otp/<normalized-user>.google_authenticator
 ```
 
-创建用户时会生成 TOTP，并把终端二维码和信息写入 `clients/<user>/<user>-otpinfo`。密钥文件最终设置为 root 所有、`0400`。重置命令为：
+创建用户时会生成 TOTP，并把终端二维码和信息写入 `clients/<user>/<user>-otpinfo`；该交付文件为 `0600`。密钥文件最终设置为 root 所有、`0400`。重置命令为：
 
 ```shell
 ovpn resetotp production alice
@@ -126,7 +126,9 @@ LDAP 模式生成 OpenVPN LDAP 插件配置，使用：
 
 当前代码只读取 `.LDAP_user[].user`；`retain_user` 和对象中的其他字段不参与授权或路由。用户名必须以字母开头，且最多 31 个字符。授权成功时，如果 CCD 不存在，会从默认模板创建空 CCD。
 
-首次 LDAP 连接由 OpenVPN 地址池提供地址，连接 Hook 在客户端状态锁内把它写为 CCD `ifconfig-push`，并追加当前/历史 IP 状态。释放状态锁后，Hook 检查该用户的规则、ipset 和 CCD 路由是否一致；缺失或不一致时只重建该用户。防火墙同步失败会拒绝本次连接，但状态记录保留，后续连接会再次检查并重试。空 CCD 没有目标白名单，用户认证可成功但转发会被拒绝，直到管理员添加路由。
+首次 LDAP 连接由 OpenVPN 地址池提供地址，连接 Hook 在客户端状态锁内把它写为 CCD `ifconfig-push`，并追加当前/历史 IP 状态；后续成功连接在同一把锁内更新最后登录时间。释放状态锁后，Hook 检查该用户的规则、ipset 和 CCD 路由是否一致；缺失或不一致时只重建该用户。防火墙同步失败会拒绝本次连接，但状态记录保留，后续连接会再次检查并重试。空 CCD 没有目标白名单，用户认证可成功但转发会被拒绝，直到管理员添加路由。
+
+`AUTO_REVOKE` 只管理本地证书用户，安装器拒绝将它与 LDAP 同时启用。LDAP 用户的停用应在 LDAP 目录和本地 JSON 授权名单中完成。
 
 当前 LDAP 配置生成器会去掉 URL 中的 scheme，再固定输出 `ldap://` 和 `TLSEnable no`。因此不能把填写 `ldaps://` 视为启用了 TLS；在可信网络之外使用前必须扩展并验证 TLS 配置。
 
@@ -138,7 +140,7 @@ LDAP 模式生成 OpenVPN LDAP 插件配置，使用：
 
 客户端配置包含 `push-peer-info`，但标准 OpenVPN 客户端不会自动提供项目使用的全部扩展字段。兼容客户端需上报 `IV_PLAT`、`IV_PLAT_VER`、`IV_USER`、`IV_INFO`、`IV_DISK` 等字段；移动端使用 `UV_UUID` 和 `IV_HWADDR` 组合设备标识。
 
-首次连接在客户端状态锁内把设备信息写入 `state/client-ips.csv`，后续连接逐项匹配。登录时间更新、首次绑定、解绑以及用户状态删除共用同一把锁，避免并发覆盖。缺字段、设备变化、未签名 GUI 标记或未知平台会拒绝连接。查看和解绑：
+首次连接采用信任首次使用（TOFU）：在客户端状态锁内记录当次上报的设备信息并允许连接，不与预置设备数据比较。后续连接逐项匹配，只有验证成功才更新最后登录时间；设备变化、未签名 GUI 标记、未知平台或后续匹配所需字段缺失会拒绝连接。首次绑定、成功登录时间、解绑以及用户状态删除共用同一把锁，避免并发覆盖。查看和解绑：
 
 ```shell
 ovpn listhwaddr production alice

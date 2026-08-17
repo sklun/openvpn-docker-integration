@@ -6,6 +6,8 @@ set -euo pipefail
 OPENVPN=${OPENVPN:-/etc/openvpn}
 # shellcheck source=/dev/null
 source "$OPENVPN/ovpn.env"
+# shellcheck source=/dev/null
+source "${OVPN_HOOKS_PATH:-$OPENVPN/hooks}/connection-state.sh"
 
 [[ ${common_name:-} =~ ^[a-zA-Z][a-zA-Z0-9._-]{0,30}$ ]] || exit 1
 
@@ -42,6 +44,8 @@ touch "$log_path" "$db_path" "$history_path" "$ccd_file"
 		record="$common_name, $client_ip, , , , , , $(date +%s)"
 		printf '%s\n' "$record" >>"$db_path"
 		printf '%s\n' "$record" >>"$history_path"
+	else
+		update_login_time_unlocked "$common_name" "$db_path"
 	fi
 } 200>"$lock_file"
 

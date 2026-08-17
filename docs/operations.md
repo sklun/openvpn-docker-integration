@@ -71,7 +71,7 @@ ovpn backuphostnetwork production
 
 密码文件是明文敏感数据。交互运行时省略命令行密码参数，避免进入历史记录；自动化应通过受控终端或重新设计秘密注入方式，不要把密码写入普通脚本。
 
-固定密码管理、用户删除和创建失败回滚共用 `auth/.static-password.lock`。客户端地址、登录时间、设备绑定、用户删除及 LDAP 首次接入共用 `state/.client-ip.lock`；防火墙操作在释放客户端状态锁后执行，避免连接状态更新等待规则重建。
+固定密码管理、用户删除和创建失败回滚共用 `auth/.static-password.lock`。客户端地址、登录时间、设备绑定、CCD 初始化、用户删除及管理命令的 CCD 路由事务共用 `state/.client-ip.lock`，避免并发命令丢失路由或状态。连接 Hook 在释放状态锁后执行防火墙操作；管理路由命令则持锁完成 CCD、运行 ipset 和失败回滚的整体变更。
 
 ## 路由操作
 
@@ -88,14 +88,14 @@ ovpn backuphostnetwork production
 
 ## 定时维护
 
-安装器在 root crontab 中追加：
+安装器在 root crontab 中管理当前环境的以下任务：
 
 ```text
 0 0 * * * /opt/openvpn-<env>/maintenance/rotate-logs.sh
 15 0 * * * /opt/openvpn-<env>/maintenance/revoke-inactive-clients.sh
 ```
 
-第二项只在安装时 `AUTO_REVOKE=true` 才添加。
+每次安装都会先移除当前环境旧的两条受管任务，再写入日志轮转任务；第二项只在 `AUTO_REVOKE=true` 时写入，因此使用 `false` 重新初始化会移除旧吊销任务。其他 crontab 行保持不变。
 
 ### 日志轮转
 
@@ -105,7 +105,7 @@ ovpn backuphostnetwork production
 
 ### 不活跃用户吊销
 
-`revoke-inactive-clients.sh` 读取当前地址状态的最后登录 Unix 时间。超过 `AUTO_REVOKE_MONTHS x 30 天` 后调用 `ovpn deluser`，并写入 `logs/revoke.log`。
+`revoke-inactive-clients.sh` 只管理本地证书用户，读取当前地址状态的最后登录 Unix 时间。超过 `AUTO_REVOKE_MONTHS x 30 天` 后调用 `ovpn deluser`，并写入 `logs/revoke.log`。安装器拒绝 LDAP 与 `AUTO_REVOKE` 同时启用，维护脚本在 LDAP 环境中也会直接跳过。
 
 没有有效最后登录时间的记录会跳过。该操作不仅吊销证书，还删除客户端目录、CCD、当前状态和固定密码，属于不可由脚本自动撤销的生命周期操作。启用前验证系统时间、备份、用户例外需求及登录时间更新链路。当前 `retain_user` 不会排除自动吊销。
 
@@ -162,4 +162,4 @@ bash -n deploy/ovpn deploy/install.sh deploy/package.sh server/build.sh tests/te
 bash tests/test.sh
 ```
 
-测试覆盖 shell 语法、配置生成、PKI/OTP、固定密码、LDAP、域名路由、规则后端选择、全量/增量规则同步、回滚和部署包结构。
+测试覆盖 shell 语法、配置生成、客户端凭据权限、设备 TOFU 与登录时间、LDAP、固定密码、CCD 并发、客户端 PID 管理、定时任务收敛、域名路由、规则后端选择、全量/增量规则同步、回滚和部署包结构。

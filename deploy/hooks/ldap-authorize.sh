@@ -21,9 +21,12 @@ fi
 
 if jq -e --arg user "$user_name" '.LDAP_user[]? | select(.user == $user)' "$authz_file" >/dev/null; then
 	ccd_file="$OPENVPN/ccd/$user_name"
-	if [[ ! -f $ccd_file ]]; then
-		cp "$OPENVPN/templates/ccd/default" "$ccd_file"
-	fi
+	{
+		flock -w 5 200 || exit 1
+		if [[ ! -f $ccd_file ]]; then
+			cp "$OPENVPN/templates/ccd/default" "$ccd_file"
+		fi
+	} 200>"$OPENVPN/state/.client-ip.lock"
 	exit 0
 fi
 
