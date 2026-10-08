@@ -38,6 +38,9 @@ usage() {
 	listroute   	| -lr  <env> <user>          		查看用户 CCD 和运行中的 ipset 路由
 	addroute    	| -ar  <env> <user> <route>  		为用户添加单 IP 或 CIDR 路由
 	delroute    	| -dr  <env> <user> <route>  		删除用户的单 IP 或 CIDR 路由
+	listiroute  	| -lir <env> <user>          		查看客户端代理路由 iroute
+	addiroute   	| -air <env> <user> <route>  		为用户添加单 IP 或 CIDR iroute
+	deliroute   	| -dir <env> <user> <route>  		删除用户的单 IP 或 CIDR iroute
 	adddomainroute	| -adr <env> <user> <source> [--yes]	解析域名文件或参数并批量添加 IPv4 路由
 	adddomainrouteall | -adra <env> <source> [--yes]		为全部 CCD 用户添加域名 IPv4 路由
 	addrouteall 	| -ara <env> <route>         		为全部 CCD 用户添加路由
@@ -75,6 +78,7 @@ usage() {
 	ovpn createuser production alice
 	ovpn clientip production alice
 	ovpn addroute production alice 10.20.0.0/16
+	ovpn addiroute production alice 192.168.20.0/24
 	ovpn adddomainroute production alice ./domains.txt
 	ovpn adddomainroute production alice example.com,api.example.com
 	ovpn adddomainroute production alice ./domains.txt --yes
@@ -624,6 +628,7 @@ normalize_route() {
 	ROUTE_CIDR="$ROUTE_IP/$ROUTE_PREFIX"
 	ROUTE_MASK=$(cidr_to_mask "$ROUTE_PREFIX")
 	ROUTE_LINE="push \"route $ROUTE_IP $ROUTE_MASK\""
+	IROUTE_LINE="iroute $ROUTE_IP $ROUTE_MASK"
 }
 
 # 为指定用户添加 CCD 路由。
@@ -886,6 +891,66 @@ list_routes() {
 	fi
 }
 
+# 返回拥有指定 iroute 的其他 CCD 用户；没有冲突时返回失败状态。
+find_iroute_owner() {
+	local ccd owner
+	for ccd in "$CCD_DIR"/*; do
+		[[ -f $ccd ]] || continue
+		owner=$(basename "$ccd")
+		[[ $owner != "$CLIENT_NAME" ]] || continue
+		if grep -Fxq "$IROUTE_LINE" "$ccd"; then
+			printf '%s\n' "$owner"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# 原子添加或删除用户 CCD 中的 iroute。
+apply_iroute() {
+	local action=$1 action_name conflict_owner temp
+	normalize_user "$USER_INPUT"
+	lock_client_state
+	[[ -f $CLIENT_CCD ]] || fail "找不到用户 CCD: $CLIENT_NAME"
+
+	if [[ $action == add ]]; then
+		action_name=添加
+		if conflict_owner=$(find_iroute_owner); then
+			fail "iroute 已属于其他用户: $ROUTE_CIDR -> $conflict_owner"
+		fi
+		if grep -Fxq "$IROUTE_LINE" "$CLIENT_CCD"; then
+			log_info "CCD 中已存在该 iroute，跳过重复写入"
+		else
+			temp=$(mktemp "${CLIENT_CCD}.XXXXXX")
+			awk -v line="$IROUTE_LINE" '{ print } END { print line }' \
+				"$CLIENT_CCD" >"$temp"
+			mv "$temp" "$CLIENT_CCD"
+		fi
+	else
+		action_name=删除
+		if ! grep -Fxq "$IROUTE_LINE" "$CLIENT_CCD"; then
+			log_info "CCD 中不存在该 iroute"
+		else
+			temp=$(mktemp "${CLIENT_CCD}.XXXXXX")
+			grep -Fvx "$IROUTE_LINE" "$CLIENT_CCD" >"$temp" || true
+			mv "$temp" "$CLIENT_CCD"
+		fi
+	fi
+
+	chmod 600 "$CLIENT_CCD"
+	chown 65534:65534 "$CLIENT_CCD" 2>/dev/null || true
+	log_success "iroute ${action_name}完成: $CLIENT_NAME -> $ROUTE_CIDR"
+	log_info "该变更在客户端下次连接时加载"
+}
+
+# 列出用户 CCD 中声明的 iroute。
+list_iroutes() {
+	normalize_user "$USER_INPUT"
+	[[ -f $CLIENT_CCD ]] || fail "找不到用户 CCD: $CLIENT_NAME"
+	log_info "查看用户 $CLIENT_NAME 的 iroute"
+	grep '^iroute ' "$CLIENT_CCD" || true
+}
+
 # 为当前环境全部 CCD 用户批量添加或删除指定路由。
 route_all() {
 	local action=$1 ccd user count=0 action_name backup_dir
@@ -1074,6 +1139,20 @@ delroute | -dr)
 	load_env
 	normalize_route "$ARGUMENT"
 	apply_route delete
+	;;
+listiroute | -lir)
+	load_env
+	list_iroutes
+	;;
+addiroute | -air)
+	load_env
+	normalize_route "$ARGUMENT"
+	apply_iroute add
+	;;
+deliroute | -dir)
+	load_env
+	normalize_route "$ARGUMENT"
+	apply_iroute delete
 	;;
 adddomainroute | -adr)
 	load_env

@@ -71,7 +71,7 @@ ovpn backuphostnetwork production
 
 密码文件是明文敏感数据。交互运行时省略命令行密码参数，避免进入历史记录；自动化应通过受控终端或重新设计秘密注入方式，不要把密码写入普通脚本。
 
-固定密码管理、用户删除和创建失败回滚共用 `auth/.static-password.lock`。客户端地址、登录时间、设备绑定、CCD 初始化、用户删除及管理命令的 CCD 路由事务共用 `state/.client-ip.lock`，避免并发命令丢失路由或状态。连接 Hook 在释放状态锁后执行防火墙操作；管理路由命令则持锁完成 CCD、运行 ipset 和失败回滚的整体变更。
+固定密码管理、用户删除和创建失败回滚共用 `auth/.static-password.lock`。客户端地址、登录时间、设备绑定、CCD 初始化、用户删除及管理命令的 CCD 路由、iroute 事务共用 `state/.client-ip.lock`，避免并发命令丢失路由或状态。连接 Hook 在释放状态锁后执行防火墙操作；管理目标路由命令则持锁完成 CCD、运行 ipset 和失败回滚的整体变更。
 
 ## 路由操作
 
@@ -81,6 +81,8 @@ ovpn backuphostnetwork production
 | `addrouteall` / `delrouteall`          | 备份全部 CCD，批量修改，一次增量更新全部用户集合；失败时恢复全部 CCD。                                                                     |
 | `adddomainroute` / `adddomainrouteall` | 宿主机解析 IPv4，显示明细并确认，备份目标 CCD，批量追加 `/32` 并一次更新 ipset。存在解析失败时，已解析地址仍会被写入，但命令最终返回失败。 |
 | `listroute`                            | 显示 CCD route push；容器运行时同时显示对应 ipset。                                                                                        |
+| `addiroute` / `deliroute`              | 原子修改用户 CCD 的客户端代理路由；不修改 ipset，同一网段不能分配给两个用户，在客户端下次连接时加载。                                      |
+| `listiroute`                           | 显示用户 CCD 中的 `iroute`；不读取运行时内部路由状态。                                                                                     |
 
 域名批量命令可能出现“部分已生效但退出码非零”：只要至少有待添加地址，解析成功项会先写入和同步，之后因其他域名解析失败而返回失败。自动化必须读取输出并重新核对 `listroute`，不能把非零退出码等同于完全没有变动。
 
