@@ -7,7 +7,7 @@
 - 独立的 `/opt/openvpn-<env>` 运行环境
 - OpenVPN Server 镜像构建和在线/离线部署
 - 证书、TOTP、固定密码及 LDAP 认证
-- 用户固定 IP、IPv4/CIDR 路由和域名 IPv4 路由
+- 用户固定 IP、IPv4/CIDR 路由、客户端代理路由 iroute 和域名 IPv4 路由
 - iptables nft/legacy 自适应、每用户 ipset 白名单和 NAT
 - 设备绑定、登录审计、日志轮转和不活跃证书吊销
 

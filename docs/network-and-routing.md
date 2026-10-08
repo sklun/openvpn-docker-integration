@@ -7,7 +7,7 @@
 | 数据         | 路径                   | 作用                                                                       |
 | ------------ | ---------------------- | -------------------------------------------------------------------------- |
 | 用户地址状态 | `state/client-ips.csv` | 用户名、固定隧道 IP、设备信息和最近登录时间；防火墙按用户名关联客户端 IP。 |
-| 用户 CCD     | `ccd/<user>`           | `ifconfig-push` 固定地址，以及 `push "route IP MASK"` 用户目标路由。       |
+| 用户 CCD     | `ccd/<user>`           | `ifconfig-push` 固定地址、`push "route IP MASK"` 用户目标路由，以及客户端代理路由的 `iroute IP MASK`。 |
 | 环境配置     | `ovpn.env`             | NAT、访问策略、iptables 后端、客户端网段等全局网络选项。                   |
 
 `state/client-ip-history.csv` 是历史映射，不参与规则构建。`state/iptables.rules`、`state/iptables.rules.backend` 和 `state/ipset.rules` 是操作后的审计快照，也不参与恢复。每次成功写入快照后都会统一为 UID/GID `65534` 和 `0600` 权限，避免容器内 root 原子替换文件造成属主漂移。
@@ -40,6 +40,46 @@ push "route 10.20.0.0 255.255.0.0"
 这些命令要求容器正在运行。它们先备份 CCD，再修改文件，并通过 `ovpn_firewall update-routes` 增量修改对应用户的 ipset。一次批量操作只调用一次容器更新。失败时恢复 CCD，并只重建本次涉及用户的规则，不触发全量同步。
 
 增量更新只改变 ipset，不重建 iptables；`IPTABLES_POLICY=false` 时不会建立或修改用户 ipset，但仍保存规则快照。CCD 的 push 指令仍会由 OpenVPN 下发给客户端。
+
+## 客户端代理路由网段（iroute）
+
+`iroute` OpenVPN 内部路由表，声明某个地址（段）可以转发给指定客户端，即客户端代理路由，与 `route` 搭配使用。
+
+### 示例
+
+例如客户端 A、B：
+
+| client | client_ip | 所在内网段     |
+| ------ | --------- | -------------- |
+| A      | 10.0.0.2  | 192.168.0.0/24 |
+| B      | 10.0.0.3  | 172.168.0.0/24 |
+
+- A CCD 添加 `push "route 172.168.0.0 255.255.255.0"`，向 A 客户端推送路由 `172.168.0.0/24`。
+- B CCD 添加 `iroute 172.168.0.0 255.255.255.0`，声明 `172.168.0.0/24` 流量应发往客户端 B。
+
+即可实现 A 通过 VPN 访问 B 所在内网 `172.168.0.0/24`。
+
+### 管理命令
+
+使用独立命令维护：
+
+```shell
+ovpn addiroute production alice 192.168.20.0/24
+ovpn listiroute production alice
+ovpn deliroute production alice 192.168.20.0/24
+```
+
+### CCD 写入格式
+
+命令把 CIDR 写为用户 CCD 中的 OpenVPN 指令：
+
+```text
+iroute 192.168.20.0 255.255.255.0
+```
+
+CCD 修改由客户端状态锁串行化，并以临时文件原子替换。同一个规范化网段不能同时属于两个用户；重复添加到原用户不会产生重复行。命令不修改用户目标访问白名单，也不更新 ipset。
+
+`iroute` 声明某个客户端可代理的地址，OpenVPN 可将该地址路由到指定客户端，需搭配 `route` 使用。
 
 ## 域名路由
 

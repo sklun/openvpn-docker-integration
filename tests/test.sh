@@ -23,6 +23,12 @@ grep -Fq 'adddomainroute' <<<"$help_output"
 grep -Fq '| -adr' <<<"$help_output"
 grep -Fq 'adddomainrouteall' <<<"$help_output"
 grep -Fq '| -adra' <<<"$help_output"
+grep -Fq 'listiroute' <<<"$help_output"
+grep -Fq '| -lir' <<<"$help_output"
+grep -Fq 'addiroute' <<<"$help_output"
+grep -Fq '| -air' <<<"$help_output"
+grep -Fq 'deliroute' <<<"$help_output"
+grep -Fq '| -dir' <<<"$help_output"
 grep -Fq '服务与规则:' <<<"$help_output"
 grep -Fq 'backuphostnetwork' <<<"$help_output"
 grep -Fq 'syncrules' <<<"$help_output"
@@ -983,6 +989,37 @@ wait "$route_pid_two"
 grep -Fxq 'push "route 10.31.0.0 255.255.0.0"' "$password_runtime/ccd/alice-test"
 grep -Fxq 'push "route 10.32.0.0 255.255.0.0"' "$password_runtime/ccd/alice-test"
 
+echo "+ CCD iroute management"
+cp "$PROJECT_ROOT/deploy/templates/ccd/default" "$password_runtime/ccd/bob-test"
+OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
+	addiroute test alice 192.168.20.0/24 >/dev/null 2>"$service_log"
+grep -Fq '* iroute 添加完成: alice-test -> 192.168.20.0/24' "$service_log"
+grep -Fq '请确保服务端 OVPN_ROUTES 覆盖 192.168.20.0/24' "$service_log"
+grep -Fxq 'iroute 192.168.20.0 255.255.255.0' "$password_runtime/ccd/alice-test"
+iroute_output=$(OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
+	listiroute test alice 2>/dev/null)
+grep -Fxq 'iroute 192.168.20.0 255.255.255.0' <<<"$iroute_output"
+OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
+	addiroute test alice 192.168.20.0/24 >/dev/null 2>"$service_log"
+[[ $(grep -Fxc 'iroute 192.168.20.0 255.255.255.0' \
+	"$password_runtime/ccd/alice-test") -eq 1 ]]
+if OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
+	addiroute test bob 192.168.20.0/24 >/dev/null 2>"$service_log"; then
+	echo "duplicate iroute owner unexpectedly succeeded" >&2
+	exit 1
+fi
+grep -Fq -- '- iroute 已属于其他用户: 192.168.20.0/24 -> alice-test' "$service_log"
+if grep -Fq 'iroute 192.168.20.0 255.255.255.0' "$password_runtime/ccd/bob-test"; then
+	echo "conflicting iroute was unexpectedly written" >&2
+	exit 1
+fi
+OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
+	deliroute test alice 192.168.20.0/24 >/dev/null 2>"$service_log"
+if grep -Fq 'iroute 192.168.20.0 255.255.255.0' "$password_runtime/ccd/alice-test"; then
+	echo "deleted iroute remains in CCD" >&2
+	exit 1
+fi
+
 echo "+ Domain route integration"
 domain_file="$TEST_ROOT/domains.txt"
 cat >"$domain_file" <<'EOF'
@@ -1020,7 +1057,6 @@ fi
 [[ $(grep -Fxc 'push "route 10.30.0.13 255.255.255.255"' "$password_runtime/ccd/alice-test") -eq 1 ]]
 [[ $(grep -Fxc 'push "route 10.30.0.14 255.255.255.255"' "$password_runtime/ccd/alice-test") -eq 1 ]]
 
-cp "$PROJECT_ROOT/deploy/templates/ccd/default" "$password_runtime/ccd/bob-test"
 printf 'push "route 10.30.0.15 255.255.255.255"\n' >>"$password_runtime/ccd/alice-test"
 OVPN_RUNTIME_ROOT="$TEST_ROOT" bash "$PROJECT_ROOT/deploy/ovpn" \
 	adddomainrouteall test all.test --yes >/dev/null 2>"$domain_log"
